@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """The store suites. SPEC-v0.6 §2.3, §2.4, §2.5.
 
 Every case is a statement about a `StateStore` method rather than about `Control`'s composition
@@ -15,6 +17,7 @@ Two rules every case obeys, both `v0.4 §1.3`'s positive-control rule one layer 
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import os
 import subprocess
@@ -22,13 +25,19 @@ import sys
 import tempfile
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from typing import Any
 
 from ...action import Action, Principal
-from ...approval import ApprovalStatus, build_request
+from ...approval import (
+    ApprovalStatus,
+    RequiredRole,
+    _granting_principal,
+    _required_roles,
+    build_request,
+)
 from ...effect import COMMITTED_EFFECT, IN_PROGRESS_EFFECT, EffectState
 from ...errors import (
     AmbiguousEffect,
@@ -38,8 +47,15 @@ from ...errors import (
     NotExecuted,
 )
 from ...policy import Decision
-from ...receipt import Event, EventType, Receipt, ReceiptResult
-from ...state import DelegationRecord, StateStore
+from ...receipt import Event, EventType, Receipt, ReceiptResult, UnreadableReceipt
+from ...state import (
+    ClockSkew,
+    DelegationRecord,
+    StateStore,
+    _decisive,
+    _explained_by_alignment,
+    _wider_margin,
+)
 from ..report import CaseResult, SuiteStatus
 from .backends import StoreBackend, store_from_url
 
@@ -144,6 +160,11 @@ def _differing_field(wrote: Any, read: Any) -> tuple[str, Any, Any] | None:
     read-only mappings `Action` freezes its arguments into (`v0.1 §2.2`).
     """
     for spec in fields(wrote):
+        if not spec.compare:
+            # A field the record excludes from its own equality is not part of what it says:
+            # `Receipt`'s stored document is how a read-back receipt is hashed (SPEC-v0.7
+            # §6.11), present on the one read and absent on the one written, by design.
+            continue
         mine, theirs = getattr(wrote, spec.name), getattr(read, spec.name, None)
         if mine != theirs:
             return spec.name, mine, theirs
@@ -436,6 +457,15 @@ def reservation_e1_cross_process(backend: StoreBackend, processes: int = CONTEND
 
 @case("retry-table", "the retry table of v0.1 §5.4, every row")
 def reservation_retry_table(backend: StoreBackend, processes: int = CONTENDERS) -> CaseResult:
+    """`v0.1 §5.4`, every row, and SPEC-v0.7 §5.6's two properties where this suite can reach them.
+
+    **No two reservations of one key carry the same attempt number, and the number a reservation
+    method returns is the number it wrote.** The `FAILED` row asserts both on the path a suite
+    can drive: the renewal is handed attempt 2 and the record says 2. The windows where a store
+    breaks them are inside one method call, a renewal stalled between its read and its write or
+    a lost `COMMIT`, and `v0.6 §2.4` says why no barrier here reaches them. SPEC-v0.7 §8.3a's
+    T246 and T246b open them against Postgres with a proxy the tests own.
+    """
     title = reservation_retry_table.title
     store = backend.open()
 
@@ -707,6 +737,66 @@ def approval_binding(backend: StoreBackend, processes: int = CONTENDERS) -> Case
     return passed("binding", title)
 
 
+@case("precondition-fingerprint", "an approval's precondition fingerprint round-trips")
+def approval_precondition_fingerprint(
+    backend: StoreBackend, processes: int = CONTENDERS
+) -> CaseResult:
+    """SPEC-v0.7 §6.4, T266. `ApprovalRecord` is rebuilt from columns, so the fingerprint the
+    recheck reads back must be one, and a store that drops it makes every approval requested
+    with a provider come back without one.
+
+    A dropping store is safe and useless, and both halves are the kernel's doing rather than this
+    store's: the request pass reads its own request back and refuses where the fingerprint is not
+    there, withdrawing the request it can reach so a later presentation of it has nothing to spend
+    (SPEC-v0.7 §6.4 states the bound and its residual), and a presentation of an approval carrying
+    one on one side only is `precondition_missing`. So an operator whose store drops this column can
+    request no approval at all for an action that names a provider. This case is what tells an
+    implementer why, by name, before an operator does.
+    """
+    title = approval_precondition_fingerprint.title
+    store = _clocked(backend, lambda: T0)
+    fingerprint = "sha256:" + "ab" * 32
+    carried = replace(
+        build_request(an_action(payment_id="txn_pf"), timedelta(minutes=15), T0),
+        precondition_fingerprint=fingerprint,
+    )
+    bare = build_request(an_action(payment_id="txn_pf0"), timedelta(minutes=15), T0)
+    store.put_approval_request(carried)
+    store.put_approval_request(bare)
+    store.grant_approval(carried.request_id, "cli:conformance")
+
+    readers: list[tuple[str, StateStore]] = [("the store that wrote it", store)]
+    reopened = backend.reopen()
+    if reopened is not None:
+        readers.append(("a second handle on the same backend", reopened))
+    for where, reader in readers:
+        record = reader.get_approval(carried.request_id)
+        listed = [r for r in reader.approvals_for(carried.action_hash)]
+        for how, found in (
+            ("get_approval", record),
+            ("approvals_for", listed[0] if listed else None),
+        ):
+            got = None if found is None else found.request.precondition_fingerprint
+            if got != fingerprint:
+                return failed(
+                    "precondition-fingerprint",
+                    title,
+                    f"{how} through {where}: precondition_fingerprint came back {got!r}, "
+                    f"expected {fingerprint!r}. Every approval requested with a provider would "
+                    "then be refused at every presentation (SPEC-v0.7 §6.4)",
+                )
+        plain = reader.get_approval(bare.request_id)
+        if plain is None or plain.request.precondition_fingerprint is not None:
+            return failed(
+                "precondition-fingerprint",
+                title,
+                f"an approval requested with no provider came back through {where} carrying "
+                f"{None if plain is None else plain.request.precondition_fingerprint!r}; absent "
+                "means absent",
+            )
+    return passed("precondition-fingerprint", title)
+
+
 @case("single-use", "an approval is consumed exactly once")
 def approval_single_use(backend: StoreBackend, processes: int = CONTENDERS) -> CaseResult:
     title = approval_single_use.title
@@ -936,6 +1026,169 @@ def continuation_taken_once_cross_process(
             results=results,
         )
     return passed("taken-once-cross-process", title)
+
+
+@case("verified-approver", "the approver columns round-trip and one principal counts once")
+def approval_verified_approver(backend: StoreBackend, processes: int = CONTENDERS) -> CaseResult:
+    """SPEC-v0.8 §2.5, §3.6, §4.2: what a store must do with the three columns v0.8 added.
+
+    Three things a store can each get wrong on its own, and every one of them is an approval
+    nobody gave:
+
+    - the roles the request pinned come back as they were written, so the kernel compares against
+      what was in force at the request and not at the answer;
+    - a verified approver is recorded with the entitlement the granting surface computed;
+    - **the same principal answering twice is one approver.** A store that appended would reach a
+      threshold of two on one person's yes, which is the defect `approvals_required` exists to
+      prevent, and the second grant is not an error: a human whose answer was rejected believes
+      it was lost.
+
+    A store that ignores the columns entirely is refused by `Control` at consumption rather than
+    silently trusted (§2.4), which is the fail-closed direction; this case says so out loud so a
+    third-party store learns it here and not from a deployment.
+    """
+    title = approval_verified_approver.title
+    store = backend.open()
+    action = an_action(payment_id="txn_verified")
+    roles = (RequiredRole(control="card-data-handling", role="payments-owner"),)
+    with _required_roles(roles, 2):
+        request = build_request(action, timedelta(minutes=15), store_now(store))
+    store.put_approval_request(request)
+
+    pinned = store.get_approval(request.request_id)
+    if pinned is None or pinned.request.required_roles != roles:
+        return failed(
+            "verified-approver",
+            title,
+            "the roles the request pinned did not come back: wrote "
+            f"{roles}, read {None if pinned is None else pinned.request.required_roles}",
+        )
+    if pinned.request.approvals_required != 2:
+        return failed(
+            "verified-approver",
+            title,
+            f"approvals_required came back {pinned.request.approvals_required}, not 2",
+        )
+
+    alice = Principal(agent="human:alice", user="alice@example.com")
+    for door in ("mcp-operator", "cli"):
+        with _granting_principal(alice, entitled=["card-data-handling"]):
+            partial_grant = store.grant_approval(request.request_id, f"{door}:alice")
+        if partial_grant is not None:
+            return failed(
+                "verified-approver",
+                title,
+                f"the {door} grant produced an Approval at 1 of 2 approvals",
+            )
+
+    after = store.get_approval(request.request_id)
+    if after is None or len(after.approvers) != 1:
+        return failed(
+            "verified-approver",
+            title,
+            "one principal answering twice is "
+            f"{0 if after is None else len(after.approvers)} approvers, not 1",
+        )
+    if after.status is not ApprovalStatus.PENDING:
+        return failed(
+            "verified-approver",
+            title,
+            f"the request is {after.status} after one principal's two answers, not pending",
+        )
+    if after.approvers[0].entitled != ("card-data-handling",):
+        return failed(
+            "verified-approver",
+            title,
+            f"the recorded entitlement is {after.approvers[0].entitled}, not the control it "
+            "was granted for",
+        )
+
+    bob = Principal(agent="human:bob", user="bob@example.com")
+    with _granting_principal(bob, entitled=["card-data-handling"]):
+        reached = store.grant_approval(request.request_id, "mcp-operator:bob")
+    if reached is None:
+        return failed("verified-approver", title, "a second distinct principal did not reach 2")
+    final = store.get_approval(request.request_id)
+    if final is None or final.status is not ApprovalStatus.GRANTED:
+        return failed(
+            "verified-approver",
+            title,
+            f"the request is {None if final is None else final.status} at 2 of 2, not granted",
+        )
+    store.close()
+    return _contended_count(backend, processes, title)
+
+
+#: SPEC-v0.8 §4.5 — the one reason this case is `not_applicable`, and it rests on the store's
+#: own declaration that its storage cannot be opened from another process, which §2.4 already
+#: allows for `url()`. A sequential pass is not evidence about a count: every assertion above
+#: holds on a store that reads and then writes with nothing in between.
+NO_CONTENTION = (
+    "this backend's storage cannot be opened from another process, so the count cannot be "
+    "contended; what passed above is the sequential half only"
+)
+
+
+def _contended_count(backend: StoreBackend, processes: int, title: str) -> CaseResult:
+    """The half that is about a **count**: N processes, and one principal in two of them.
+
+    SPEC-v0.8 §4.3. A store deciding the threshold by a read and then a write passes every
+    sequential assertion in this case and fails here, which is the whole reason `processes` is
+    a parameter: an earlier draft accepted it and never used it, so the case asserted nothing
+    about concurrency while sitting in a suite named for it.
+
+    `alice` answers from **two** of the contenders and `bob` from the rest. Whatever the
+    interleaving, the row must end with exactly two approvers, because there are exactly two
+    principals; a store that appends reaches three or more, and one that loses an update
+    reaches one.
+    """
+    store = backend.open()
+    action = an_action(payment_id="txn_contended")
+    with _required_roles((), 2):
+        request = build_request(action, timedelta(minutes=15), store_now(store))
+    store.put_approval_request(request)
+    store.close()
+
+    people = [("human:alice", "alice@example.com")] * 2 + [("human:bob", "bob@example.com")] * max(
+        1, processes - 2
+    )
+    outcome = race(
+        backend,
+        len(people),
+        [
+            {
+                "kind": "answer",
+                "answer": "grant",
+                "approval_id": request.request_id,
+                "who": f"conformance-{index}",
+                "agent": agent,
+                "user": user,
+            }
+            for index, (agent, user) in enumerate(people)
+        ],
+    )
+    if isinstance(outcome, str):
+        if not storage_is_confined(backend):
+            return dishonest("verified-approver", title, "url()")
+        return na("verified-approver", title, NO_CONTENTION)
+
+    after = backend.open()
+    try:
+        record = after.get_approval(request.request_id)
+    finally:
+        after.close()
+    if record is None:
+        return failed("verified-approver", title, "the contended request did not come back")
+    agents = sorted({approver.agent for approver in record.approvers})
+    if len(record.approvers) != 2 or agents != ["human:alice", "human:bob"]:
+        return failed(
+            "verified-approver",
+            title,
+            f"{len(people)} contenders and two principals left "
+            f"{[approver.agent for approver in record.approvers]}: a count decided by a read "
+            "and then a write either loses one of them or counts one of them twice",
+        )
+    return passed("verified-approver", title)
 
 
 # --- resolution (v0.1 §7 T10; §5.2) ---------------------------------------------------------
@@ -1513,6 +1766,18 @@ def evidence_receipt(backend: StoreBackend, processes: int = CONTENDERS) -> Case
     back = [held for held in store.receipts() if held.receipt_id == receipt.receipt_id]
     if not back:
         return failed("receipt-round-trip", title, "the receipt did not come back")
+    if isinstance(back[0], UnreadableReceipt):
+        # SPEC-v0.11 §5.2 lets a store hand back a row it cannot construct instead of raising,
+        # so that one tampered row costs one row. **A row this store just wrote is not that
+        # case.** A candidate backend that cannot read back its own write fails here, by name,
+        # rather than falling into the field-by-field diff below and reporting a missing
+        # attribute.
+        return failed(
+            "receipt-round-trip",
+            title,
+            f"the receipt came back as unreadable ({back[0].refusal}); a store that cannot read "
+            "back the receipt it just wrote has not stored it",
+        )
     receipt = written
     # Every field, not two of seventeen. A store that mangled `decision`, `approver`,
     # `arguments`, `attempt` or the timestamps passed this case while the two it compared
@@ -1737,6 +2002,177 @@ def delegation_grant_json(backend: StoreBackend, processes: int = CONTENDERS) ->
     return passed("grant-json-round-trip", title)
 
 
+# --- clock (SPEC-v0.7 §3, §8 T214) -----------------------------------------------------------
+
+#: The one reason this case is `not_applicable`, and only where the attribute is **absent**. A
+#: sentence true of every backend that reaches it, a third-party store with a clock it does not
+#: expose included.
+NO_CLOCK_MEASUREMENT = (
+    "this backend exposes no clock measurement; SQLite and the in-memory store read only the "
+    "application's clock and have none to expose"
+)
+
+#: How far past the threshold the case injects skew: §8 T209's five seconds.
+SKEW_MARGIN = timedelta(seconds=5)
+
+_ABSENT = object()
+
+
+def _exposes_clock_skew(store: StateStore) -> bool:
+    """Is the optional attribute there at all? Asked without calling it, so a property that
+    raises `AttributeError` is a read that raised and not an absent attribute; and asked through
+    `getattr` too, so a forwarding wrapper that does reach a real one counts as exposing it."""
+    if inspect.getattr_static(store, "clock_skew", _ABSENT) is not _ABSENT:
+        return True
+    try:
+        getattr(store, "clock_skew")  # noqa: B009 - not on the StateStore protocol
+    except AttributeError:
+        return False
+    except Exception:
+        return True
+    return True
+
+
+def _clock_skew_of(store: StateStore) -> tuple[ClockSkew | None, str | None]:
+    """The store's measurement, or the reason it is unusable. `Control` would ignore anything
+    but a `ClockSkew` or `None` silently in production, so the suite is where its author finds
+    out."""
+    try:
+        value = getattr(store, "clock_skew")  # noqa: B009 - not on the StateStore protocol
+    except Exception as broke:
+        return None, (
+            f"reading clock_skew raised {type(broke).__name__}: {broke}; Control ignores such a "
+            "store, so its skew would never be reported"
+        )
+    if value is None or isinstance(value, ClockSkew):
+        return value, None
+    return None, (
+        f"clock_skew is a {type(value).__name__}, not a ctrlrun.state.ClockSkew; Control ignores "
+        "it, so this store's skew would never be reported"
+    )
+
+
+#: How many times the case may align again, or widen an injection, before it says it could not
+#: establish divergence on this link. Every loop in this suite is bounded.
+SKEW_ATTEMPTS = 3
+
+
+def _host_clock_shifted(by: timedelta) -> Callable[[], datetime]:
+    """The host's clock, shifted. A function and not a lambda closing over a loop variable: the
+    stores here are opened inside loops, and a closure would hand the last shift to all of them.
+    """
+    return lambda: datetime.now(UTC) + by
+
+
+def _unestablished(what: str, measured: ClockSkew | None) -> str:
+    """The reason for a link the case could not outrun. It names the link, not the store: a
+    silence inside a conforming store's own bound is not a finding about it."""
+    bound = "unknown" if measured is None else str(measured.bound)
+    return (
+        f"could not establish {what} in {SKEW_ATTEMPTS} attempts: the store's measurements "
+        f"carry a bound of {bound}, half their round trip, and the case could not make its "
+        "injection decisive against it. This is a property of the link to the store, not a "
+        "report the store failed to make; grade it over a faster one"
+    )
+
+
+@case("skew-measured", "a store with its own clock names divergence from the application's")
+def clock_skew_measured(backend: StoreBackend, processes: int = CONTENDERS) -> CaseResult:
+    """SPEC-v0.7 §3, §8 T214. An injected skew is reported and an aligned clock is not.
+
+    **Aligned, not raw.** The case first measures the store against the host's real clock and
+    then aligns by the offset it found, so a CI runner whose clock has drifted grades the store
+    and not the runner. Both halves are asserted, because a detector that always fires passes
+    the first and one that never fires passes the second.
+
+    **Sized against the bound, never fixed.** A conforming store reports only past
+    `threshold + bound`, so an injection is graded only once it is decisive against the bound
+    the shifted store measured and the aligning measurement's own doubt; until then the case
+    widens it and opens again. A report on the aligned clock that the aligning measurement's
+    doubt could explain is met by aligning again. A link it cannot outrun in `SKEW_ATTEMPTS` is
+    reported as that, by name, and never as a store that stayed silent.
+
+    The suite's only seam is `open_with_clock`, and that is enough: the skew is injected on the
+    application's side, which is the direction an operator's hosts get wrong.
+    """
+    case_id, title = "skew-measured", clock_skew_measured.title
+    probe = backend.open()
+    if not _exposes_clock_skew(probe):
+        return na(case_id, title, NO_CLOCK_MEASUREMENT)
+
+    first: ClockSkew | None = None
+    aligned: ClockSkew | None = None
+    for _ in range(SKEW_ATTEMPTS):
+        first, problem = _clock_skew_of(probe)
+        if problem is not None:
+            return failed(case_id, title, problem)
+        if first is None:
+            return failed(
+                case_id,
+                title,
+                "clock_skew is None after open: the store retained no measurement, and a "
+                "detector that never ran cannot be graded",
+            )
+        at = first.skew
+        aligned, problem = _clock_skew_of(backend.open_with_clock(_host_clock_shifted(-at)))
+        if problem is not None:
+            return failed(case_id, title, problem)
+        if aligned is None:
+            return failed(case_id, title, "an aligned store retained no measurement at open")
+        if not aligned.exceeded:
+            break
+        if not _explained_by_alignment(aligned, first.bound):
+            return failed(
+                case_id,
+                title,
+                f"an application clock aligned with the store's was reported as {aligned.skew} "
+                f"off (bound {aligned.bound}, threshold {aligned.threshold}, alignment within "
+                f"{first.bound}): a detector that fires on an aligned clock is one nobody keeps",
+            )
+        probe = backend.open()
+    else:
+        return failed(case_id, title, _unestablished("an aligned clock", aligned))
+    assert first is not None
+    offset, alignment, threshold = first.skew, first.bound, first.threshold
+
+    for direction, sign in (("ahead of", 1), ("behind", -1)):
+        margin = SKEW_MARGIN
+        measured: ClockSkew | None = None
+        for _ in range(SKEW_ATTEMPTS):
+            injected = sign * (threshold + margin)
+            opened = backend.open_with_clock(_host_clock_shifted(injected - offset))
+            measured, problem = _clock_skew_of(opened)
+            if problem is not None:
+                return failed(case_id, title, problem)
+            if measured is None:
+                return failed(
+                    case_id,
+                    title,
+                    f"an application clock {direction} the store's by {abs(injected)} was not "
+                    "reported (measured None: the store retained no measurement at open)",
+                )
+            if _decisive(injected, measured, alignment):
+                break
+            margin = max(margin, _wider_margin(measured, alignment, SKEW_MARGIN))
+        else:
+            return failed(case_id, title, _unestablished(f"a clock {direction} it", measured))
+        if not measured.exceeded:
+            return failed(
+                case_id,
+                title,
+                f"an application clock {direction} the store's by {abs(injected)} was not "
+                f"reported (measured {measured.skew} within {measured.bound})",
+            )
+        if (measured.skew > timedelta(0)) is not (sign > 0):
+            return failed(
+                case_id,
+                title,
+                f"an application clock {direction} the store's was measured as {measured.skew}; "
+                "a positive skew means the application is ahead",
+            )
+    return passed(case_id, title)
+
+
 # --- clock plumbing -------------------------------------------------------------------------
 
 
@@ -1757,10 +2193,12 @@ SUITES: Mapping[str, tuple[Case, ...]] = {
         approval_consume_cross_process,
         approval_answered_once,
         approval_binding,
+        approval_precondition_fingerprint,
         approval_single_use,
         approval_expiry,
         approval_atomic,
         approval_checked_first,
+        approval_verified_approver,
     ),
     "resolution": (resolution_only_ambiguous, resolution_two_targets, resolution_attribution),
     "outcome": (outcome_no_failed_on_refusal, outcome_no_not_executed),
@@ -1772,6 +2210,7 @@ SUITES: Mapping[str, tuple[Case, ...]] = {
         continuation_extend_lease,
     ),
     "delegation": (delegation_insert, delegation_revoke, delegation_grant_json),
+    "clock": (clock_skew_measured,),
 }
 
 

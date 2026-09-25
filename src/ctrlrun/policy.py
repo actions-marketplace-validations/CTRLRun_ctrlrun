@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """Policy loading and rule evaluation to a Decision. Build-list item 2; SPEC-v0.1 §3.
 
 SPEC-v0.2 §3 adds per-action `effect:` and `resource:` templates, because the gateway has no
@@ -12,14 +14,13 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import operator
 import os
+import re
 import unicodedata
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
-from enum import StrEnum
-from functools import cached_property
+from functools import cached_property, partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final, Literal
@@ -27,39 +28,53 @@ from typing import Any, Final, Literal
 import yaml
 
 from .action import Action, PlainValue, canonical_bytes
+from .decision import POLICY_UNAPPROVED as POLICY_UNAPPROVED
+from .decision import Decision as Decision
 from .effect import template_placeholders
 from .errors import InvalidArgument, PolicyError
+from .grammar import _NUMERIC_COMPARE as _NUMERIC_COMPARE
+from .grammar import _OPERATORS as _OPERATORS
+from .grammar import _OPERATORS_BY_LENGTH as _OPERATORS_BY_LENGTH
+from .grammar import _V3_TOP_LEVEL_KEYS as _V3_TOP_LEVEL_KEYS
+from .grammar import _V7_GRANT_KEYS as _V7_GRANT_KEYS
 
-#: The schema `ctrlrun init` writes, and the one every v0.1 file declares.
-POLICY_SCHEMA: Final = "ctrlrun.policy/v1"
+# Re-exported, not merely used. `SPEC-v0.1.md` §8 freezes `from .policy import Decision, Policy`
+# in `__init__.py`, and `adapter.py` imports `Decision` from here too. Both names moved down to
+# break the module cycle §6 records, and both still resolve from this module because that block
+# is a frozen public surface and a cycle is not a reason to move a published import path.
+# Re-exported, not merely used. `SPEC-v0.3.md` §8 freezes
+# `from .policy import Condition, parse_conditions`, and `SPEC-v0.1.md` §8 the `__init__` block,
+# so every one of these keeps resolving from here. They moved to `grammar.py` to break the last
+# cycle §6 carried an exception for; see that module.
+from .grammar import DERIVED_SUBJECTS as DERIVED_SUBJECTS
+from .grammar import MODE_KEY as MODE_KEY
+from .grammar import POLICY_SCHEMA as POLICY_SCHEMA
+from .grammar import POLICY_SCHEMA_V2 as POLICY_SCHEMA_V2
+from .grammar import POLICY_SCHEMA_V3 as POLICY_SCHEMA_V3
+from .grammar import POLICY_SCHEMA_V4 as POLICY_SCHEMA_V4
+from .grammar import POLICY_SCHEMA_V5 as POLICY_SCHEMA_V5
+from .grammar import POLICY_SCHEMA_V6 as POLICY_SCHEMA_V6
+from .grammar import POLICY_SCHEMA_V7 as POLICY_SCHEMA_V7
+from .grammar import POLICY_SCHEMA_V8 as POLICY_SCHEMA_V8
+from .grammar import RESERVED_ARGUMENTS as RESERVED_ARGUMENTS
+from .grammar import SUPPORTED_SCHEMAS as SUPPORTED_SCHEMAS
+from .grammar import Condition as Condition
+from .grammar import _at_least as _at_least
+from .grammar import _checked_operand as _checked_operand
+from .grammar import _equal as _equal
+from .grammar import _is_container as _is_container
+from .grammar import _is_int as _is_int
+from .grammar import _parse_condition as _parse_condition
+from .grammar import _parse_operand as _parse_operand
+from .grammar import _split_condition_key as _split_condition_key
+from .grammar import _StrictLoader as _StrictLoader
+from .grammar import _type_name as _type_name
+from .grammar import parse_conditions as parse_conditions
+from .grammar import reject_nested_mode as reject_nested_mode
+from .grammar import require_v3 as require_v3
+from .grammar import require_v7 as require_v7
+from .grammar import strict_load as strict_load
 
-#: SPEC-v0.2 §3.1 — required by any document using `effect:`, `resource:` or `mcp:`. A v2
-#: file fails to load on v0.1, correctly: v0.1 would ignore the effect template and execute
-#: with no duplicate protection at all. The schema string is the only thing standing between
-#: those two outcomes, so it is not optional and not inferred.
-POLICY_SCHEMA_V2: Final = "ctrlrun.policy/v2"
-
-#: SPEC-v0.3 §12.1 — required by any document using `environment:`, and later by `authority:`
-#: and `mode:`. A v3 key in an older document is a load error naming the key and the schema,
-#: for the reason v0.2 gives: a reader that ignored it would run with a guarantee switched off.
-POLICY_SCHEMA_V3: Final = "ctrlrun.policy/v3"
-
-#: SPEC-v0.6 §7.1, §9.5 — required by any document using `version:`, `controls:` or `data:`.
-#: `v1`, `v2` and `v3` documents load unchanged and get a `policy_hash` like any other; only
-#: those three keys need `v4`.
-POLICY_SCHEMA_V4: Final = "ctrlrun.policy/v4"
-
-#: All of them, newest last, for the message an unknown schema produces.
-SUPPORTED_SCHEMAS: Final = (
-    POLICY_SCHEMA,
-    POLICY_SCHEMA_V2,
-    POLICY_SCHEMA_V3,
-    POLICY_SCHEMA_V4,
-)
-
-#: SPEC-v0.3 §6.1 — the two values of the top-level `mode:` key, and nothing else. Absent
-#: means `enforce`: the fail-closed default, so a document that predates the key enforces.
-MODE_KEY: Final = "mode"
 OBSERVE: Final = "observe"
 ENFORCE: Final = "enforce"
 POLICY_MODES: Final = (OBSERVE, ENFORCE)
@@ -74,15 +89,6 @@ BARE_DECISION: Final = "decision"
 
 _LOG = logging.getLogger(__name__)
 
-_NUMERIC_COMPARE: Final[Mapping[str, Callable[[int, int], bool]]] = {
-    "lt": operator.lt,
-    "lte": operator.le,
-    "gt": operator.gt,
-    "gte": operator.ge,
-}
-_OPERATORS: Final = ("eq", "neq", "in", *_NUMERIC_COMPARE)
-#: Longest first, so `amount_neq` reads as (amount, neq) and never as (amount_n, eq).
-_OPERATORS_BY_LENGTH: Final = tuple(sorted(_OPERATORS, key=len, reverse=True))
 
 _TOP_LEVEL_KEYS: Final = frozenset(
     {"schema", "actions", "environment", "authority", "mode", "version", "controls"}
@@ -94,7 +100,7 @@ _TOP_LEVEL_KEYS: Final = frozenset(
 #: §3.1's key sets are closed and a `version:` an older reader silently dropped would be a typo
 #: that never surfaced.
 #: The closed key set of one registry entry (§7.3, and §3.1's rule).
-_CONTROL_KEYS: Final = frozenset({"title", "source"})
+_CONTROL_KEYS: Final = frozenset({"title", "source", "approver_role"})
 
 _V4_TOP_LEVEL_KEYS: Final[Mapping[str, str]] = {
     "controls": (
@@ -106,15 +112,6 @@ _V4_TOP_LEVEL_KEYS: Final[Mapping[str, str]] = {
     ),
 }
 
-#: SPEC-v0.3 §12.1 — the top-level keys that need `ctrlrun.policy/v3`, and what an older
-#: reader would do with each if it ignored one.
-_V3_TOP_LEVEL_KEYS: Final[Mapping[str, str]] = {
-    "environment": ("an older reader would ignore it and put every action in the wrong deployment"),
-    "authority": (
-        "an older reader would ignore it and run every action with no authority check at all"
-    ),
-    "mode": ("an older reader would enforce a configuration that was deployed to observe"),
-}
 #: §7.4 — the action-entry keys that need `ctrlrun.policy/v4`, and what an older reader would do.
 _V4_ENTRY_KEYS: Final[Mapping[str, str]] = {
     "data": (
@@ -123,15 +120,70 @@ _V4_ENTRY_KEYS: Final[Mapping[str, str]] = {
     ),
 }
 
+#: SPEC-v0.7 §5.3 — the action-entry key that needs `ctrlrun.policy/v5`, and the same sentence:
+#: what an older reader would do with the document if it ignored the key.
+_V5_ENTRY_KEYS: Final[Mapping[str, str]] = {
+    "max_attempts": (
+        "an older reader would ignore the ceiling and renew over `FAILED` without bound, which "
+        "is the behaviour this key exists to stop"
+    ),
+}
+
+#: SPEC-v0.8 §4.2 — the M-of-N threshold, gated for `max_attempts`'s reason: an older reader
+#: would ignore it and consume on the first grant, which is a deployment believing two humans
+#: answered when one did.
+#: SPEC-v0.8 §8.2. The one action name the policy-change flow owns, and the only reserved name
+#: in this project. **Reserved and declarable**, which a first draft had backwards: `evaluate`
+#: answers `DENY unknown_action` for any name a document does not list, so a name no document
+#: may declare is a name every proposal is denied for, no committed receipt is ever written,
+#: and a deployment with `require_approved_policy=True` denies every action for ever. The two
+#: rules were mutually exclusive.
+POLICY_CHANGE_ACTION: Final = "ctrlrun.policy.change"
+
+#: SPEC-v0.10 §4.5 — the two upstream refusals, separately observable because "the server
+#: changed" and "nobody has checked" are different findings an operator fixes differently.
+#: `UPSTREAM_UNVERIFIED` is the fail-closed half and the one to get right: a pin that does
+#: nothing when nothing was observed is a pin an upstream can switch off by never being seen.
+UPSTREAM_MISMATCH: Final = "upstream_mismatch"
+UPSTREAM_UNVERIFIED: Final = "upstream_unverified"
+
+_V6_ENTRY_KEYS: Final[Mapping[str, str]] = {
+    "approvals_required": (
+        "an older reader would ignore the threshold and consume on the first grant, which is a "
+        "deployment believing several humans answered when one did"
+    ),
+}
+
+#: SPEC-v0.10 §4.6 — the action-entry key `ctrlrun.policy/v8` adds, gated in the shape
+#: `_V4_ENTRY_KEYS` and `_V5_ENTRY_KEYS` use and **not** `require_v7`'s: that one walks
+#: `authority.grants`, because `tasks:` and `budgets:` are grant keys, and a standalone
+#: `--authority` document carries no action entries at all.
+_V8_ENTRY_KEYS: Final[Mapping[str, str]] = {
+    "upstream": (
+        "an older reader would ignore the pin and authorise the action against any server at "
+        "all, which is the whole of what the key restricts"
+    ),
+}
+
 _RULE_KEYS: Final = frozenset({"when", "decision", "controls"})
 
 #: SPEC-v0.2 §3.1 — the keys `ctrlrun.policy/v2` adds to an action entry. The gateway has no
 #: decorator to carry an effect template, so the policy file has to.
 _V2_ENTRY_KEYS: Final = frozenset({"effect", "resource", "mcp"})
-_ENTRY_KEYS: Final = frozenset({"decision", "rules", "controls", "data"}) | _V2_ENTRY_KEYS
+_ENTRY_KEYS: Final = (
+    frozenset({"decision", "rules", "controls", "data"})
+    | _V2_ENTRY_KEYS
+    | frozenset(_V5_ENTRY_KEYS)
+    | frozenset(_V6_ENTRY_KEYS)
+    | frozenset(_V8_ENTRY_KEYS)
+)
 
 #: And the closed key set of the `mcp` mapping, which is one key wide.
 _MCP_KEYS: Final = frozenset({"not_executed_on_error"})
+
+#: SPEC-v0.10 §4.2 — the pin's closed key set, and the shape of a `sha256:` digest.
+_UPSTREAM_KEYS: Final = frozenset({"tls_cert_sha256", "tls_cert_file", "tool_schema_sha256"})
+_SHA256: Final = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 #: Names of `Action` fields (SPEC-v0.1 §2.1), which a condition cannot address: conditions
 #: see the action's *arguments* and nothing else (§3.2). Writing one reads like it scopes a
@@ -146,35 +198,6 @@ _MCP_KEYS: Final = frozenset({"not_executed_on_error"})
 #: `v0.3 §2.5`'s last rank. Here rather than in `control.py` because `_canonical_policy`
 #: needs it and dependencies point downward: `policy.py` does not import `control.py`.
 DEFAULT_ENVIRONMENT: Final = "production"
-
-RESERVED_ARGUMENTS: Final = frozenset(
-    {
-        "action_id",
-        "agent",
-        "claims",
-        "data_scope",
-        "environment",
-        "expires_at",
-        "issuer",
-        "principal",
-        "resource",
-        "user",
-    }
-)
-
-#: SPEC-v0.6 §7.4 — names refused as **arguments** and permitted as **condition subjects**,
-#: resolved at evaluation from something other than `action.canonical_arguments`.
-#:
-#: The distinction is what makes `data_scope` implementable at all. Today one check does both
-#: jobs: the splitter refuses a condition whose subject is in `RESERVED_ARGUMENTS`, which is how
-#: `claims_eq:` becomes a load error. Adding `data_scope` to that set unchanged would have made
-#: `data_scope_in:` a load error too -- the very condition §7.4 asks operators to write.
-#:
-#: **A name here is still refused as an argument**, so one name never means two things in one
-#: document. And this list is the *policy evaluator's*: authority `constraints:` do not consult
-#: it, so a grant naming `data_scope` is refused exactly as it always was (§11 puts matching a
-#: grant on a data label out of scope).
-DERIVED_SUBJECTS: Final = frozenset({"data_scope"})
 
 
 def _refuse_reserved(names: Iterable[str], where: str, what: str) -> None:
@@ -202,7 +225,7 @@ def _refuse_reserved(names: Iterable[str], where: str, what: str) -> None:
     offending = sorted(name for name in names if name in DERIVED_SUBJECTS)
     if offending:
         raise PolicyError(
-            f"{where}: {', '.join(repr(name) for name in offending)} is derived by CTRLRun and "
+            f"{where}: {', '.join(repr(name) for name in offending)} is derived by ctrlrun and "
             f"may not be {what}. §7.4 resolves it at evaluation from the arguments actually "
             "supplied, so an argument of the same name would mean two things in one rule; "
             "rename the argument"
@@ -231,17 +254,6 @@ _CUT_DATA_KEYS: Final[Mapping[str, str]] = {
 }
 
 
-class Decision(StrEnum):
-    """What may happen to an action: exactly three outcomes in v0.1 (SPEC-v0.1 §3.3).
-
-    `StrEnum`, so a member renders as its value in receipts and CLI output (SPEC-v0.1 §6.1).
-    """
-
-    ALLOW = "allow"
-    APPROVE = "approve"
-    DENY = "deny"
-
-
 @dataclass(frozen=True)
 class Evaluation:
     """A decision and the reason it was reached, e.g. `rule[1]` or `unknown_action`."""
@@ -257,123 +269,6 @@ class Evaluation:
     #: decision would be a control that enforced something, and §7.3's second rule forbids
     #: exactly that reading.
     controls: tuple[str, ...] = ()
-
-
-def _is_int(value: object) -> bool:
-    """True for a real int. `bool` subclasses int in Python; SPEC-v0.1 §3.2 excludes it."""
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _type_name(value: object) -> str:
-    return type(value).__name__
-
-
-def _equal(value: object, operand: object) -> bool:
-    """Type-strict equality: `True` never equals `1`, and a list never equals a scalar.
-
-    SPEC: §3.2 — equality is type-strict and applies recursively inside containers.
-    Canonical arguments distinguish bool from int (§2.3), so conditions must too, or a
-    policy written for `1` would match `True`.
-    """
-    if isinstance(value, bool) or isinstance(operand, bool):
-        return value is operand
-    if isinstance(value, Mapping) and isinstance(operand, Mapping):
-        return value.keys() == operand.keys() and all(
-            _equal(value[key], operand[key]) for key in value
-        )
-    if isinstance(value, list | tuple) and isinstance(operand, list | tuple):
-        return len(value) == len(operand) and all(
-            _equal(item, other) for item, other in zip(value, operand, strict=True)
-        )
-    if _is_container(value) or _is_container(operand):
-        return False
-    return bool(value == operand)
-
-
-def _is_container(value: object) -> bool:
-    return isinstance(value, Mapping | list | tuple)
-
-
-@dataclass(frozen=True)
-class Condition:
-    """One `<argument>_<op>: operand` test against an action's arguments (SPEC-v0.1 §3.2).
-
-    Public since SPEC-v0.3 §11, because a `Grant`'s constraints are made of them and the two
-    axes share one evaluator: a second implementation would be a second place for `True` to
-    start comparing equal to `1`. `key` is the raw condition key the author wrote.
-    """
-
-    key: str
-    argument: str
-    op: str
-    operand: Any
-
-    def matches(self, action_name: str, arguments: Mapping[str, Any]) -> bool:
-        if self.argument not in arguments:
-            # SPEC §3.2 — still false, never an error, but never silent either. Defaults are
-            # applied when a call is bound (§8), so an argument is either always present or
-            # never: an absent one is a typo, and silence let a mistyped rule disappear into
-            # a catch-all below it.
-            _LOG.warning(
-                "%s: condition %s ignored: the action has no argument %r (it has: %s)",
-                action_name,
-                self.key,
-                self.argument,
-                ", ".join(sorted(arguments)) or "none",
-            )
-            return False
-        value = arguments[self.argument]
-        if self.op in {"eq", "neq"} and self.argument in DERIVED_SUBJECTS:
-            # SPEC-v0.6 §7.4: *"`_eq` and `_neq` compare the whole set."* **The whole set, and
-            # a set has no order.** The derived value is a `sorted(...)` list, and `_equal` on
-            # lists is order-sensitive -- so an independent review found `data_scope_eq: [phi,
-            # internal]` never matching, silently, while `[internal, phi]` did. An operator
-            # writing the labels in the order their own `data:` map declares them gets a rule
-            # that never fires, with no warning: the key splits, the subject is present, and
-            # `matches` simply returns `False` and falls through to whatever is below. Where
-            # the rule was the `deny` or `approve`, that is fail-open.
-            #
-            # Narrowed to `DERIVED_SUBJECTS` for exactly the reason `_in` below is: an ordinary
-            # list-valued argument means *this list*, and `value_eq: [1, 2]` against `[2, 1]`
-            # must stay false. This branch is one line away from the one that regressed when it
-            # was written too wide, and it is written narrow for the same reason.
-            if not isinstance(value, list | tuple) or not isinstance(self.operand, list | tuple):
-                return (
-                    _equal(value, self.operand)
-                    if self.op == "eq"
-                    else not _equal(value, self.operand)
-                )
-            same = frozenset(value) == frozenset(self.operand)
-            return same if self.op == "eq" else not same
-        if self.op == "eq":
-            return _equal(value, self.operand)
-        if self.op == "neq":
-            return not _equal(value, self.operand)
-        if self.op == "in":
-            if self.argument in DERIVED_SUBJECTS and isinstance(value, list | tuple):
-                # SPEC-v0.6 §7.4 — a **derived, set-valued** subject intersects the list, which
-                # is the membership `_in` already expresses one element at a time. §7.4 adds no
-                # operator for it: `contains` and `not_in` would land in `_OPERATORS`, which
-                # authority `constraints:` share (`v0.3 §4.5` -- one implementation, not two),
-                # and §11 puts matching a grant on a data label out of scope.
-                #
-                # **Narrowed to derived subjects, and the first version was not.** Testing every
-                # list-valued subject changed `_in` for ordinary arguments: `value_in: [[1, 2]]`
-                # against `value = [1, 2]` means *this exact list is one of the operands* and has
-                # since v0.1, and intersecting broke it. A rule about a new subject may not
-                # quietly re-mean an operator for the old ones.
-                return any(_equal(item, candidate) for item in value for candidate in self.operand)
-            return any(_equal(value, item) for item in self.operand)
-        if not _is_int(value):
-            _LOG.warning(
-                "%s: condition %s ignored: argument %r is %s, not int",
-                action_name,
-                self.key,
-                self.argument,
-                _type_name(value),
-            )
-            return False
-        return _NUMERIC_COMPARE[self.op](value, self.operand)
 
 
 @dataclass(frozen=True)
@@ -403,7 +298,7 @@ class _Rule:
 class DataLabel:
     """What class of data one argument carries (SPEC-v0.6 §7.4).
 
-    `label` is the operator's own word -- `phi`, `internal`, `pci`. CTRLRun does not know what
+    `label` is the operator's own word -- `phi`, `internal`, `pci`. ctrlrun does not know what
     any of them mean; it derives the *set* present in an action's arguments so a rule can see it.
 
     **There is no `redact`.** §7.4 put it on probation and §7.5's throwaway sector configuration
@@ -425,7 +320,7 @@ class PolicyControl:
     as a name nobody should have to disambiguate at a call site, and which §9.1 would have frozen
     for a long time. Renamed in the same change that adds it to §9.1.1's list.
 
-    **CTRLRun does not interpret a control.** `source:` is a string the operator wrote. The
+    **ctrlrun does not interpret a control.** `source:` is a string the operator wrote. The
     kernel does not know what PCI DSS is, does not check the clause exists, and makes no
     compliance, conformance or alignment claim on the strength of one -- validating a citation
     would be the beginning of interpreting it.
@@ -439,6 +334,15 @@ class PolicyControl:
     id: str
     title: str
     source: str | None = None
+    #: SPEC-v0.8 §3.2 — which role may answer an approval this control was cited on. An opaque
+    #: string: ctrlrun does not know what it means, does not check that such a role exists, and
+    #: makes no compliance claim on the strength of one, exactly as it does not interpret
+    #: `source`. What it does is decide **who may answer an approval the decision already
+    #: required**, which is the first thing a control has ever decided (§3.2).
+    #:
+    #: `None` means this control gates nothing, which is 0.7.0's behaviour for it and is the
+    #: opposite answer to a principal whose claims carry no role (§3.5).
+    approver_role: str | None = None
 
 
 def _in_registry_order(cited: tuple[str, ...], order: tuple[str, ...]) -> tuple[str, ...]:
@@ -454,6 +358,36 @@ def _in_registry_order(cited: tuple[str, ...], order: tuple[str, ...]) -> tuple[
     rank = {identifier: index for index, identifier in enumerate(order)}
     known = sorted((item for item in cited if item in rank), key=lambda item: rank[item])
     return tuple(known) + tuple(item for item in cited if item not in rank)
+
+
+@dataclass(frozen=True)
+class UpstreamPin:
+    """Which server an action entry authorises itself against (SPEC-v0.10 §4.2).
+
+    **Not folded into `McpOptions`**, which is the closest existing name: that one carries
+    claims an operator makes about their upstream's *behaviour* (`not_executed_on_error` is a
+    `NotExecuted` hint), and this carries a claim about its *identity*, which is an
+    authorization input. Merging them would put a pin inside a structure whose documented job
+    is a classifier hint.
+
+    **Two TLS keys, because a digest cannot be a trust anchor.** `certs` feeds §4.3's check 3,
+    where the pinned certificates become the connection's only trust anchors and a swapped
+    server fails the handshake; `SSLContext.load_verify_locations` takes PEM, and there is no
+    way to hand OpenSSL a hash and have it validate a chain. `cert_sha256` feeds checks 1 and 2,
+    which compare what was observed. An entry pinning by digest alone gets the first two checks
+    and not the third, which §4.2 states as a limit rather than leaving to be discovered.
+
+    The two must agree: every certificate `certs` holds hashes to a digest `cert_sha256` names,
+    checked at load. A rotation that moved only one half would fail at the handshake on a day
+    an operator believed they had prepared for.
+    """
+
+    cert_sha256: tuple[str, ...] = ()
+    certs: tuple[str, ...] = ()
+    tool_schema_sha256: str | None = None
+
+    def __bool__(self) -> bool:
+        return bool(self.cert_sha256 or self.certs or self.tool_schema_sha256)
 
 
 @dataclass(frozen=True)
@@ -479,10 +413,30 @@ class _ActionPolicy:
     effect: str | None = None
     resource: str | None = None
     mcp: McpOptions = _DEFAULT_MCP_OPTIONS
+    #: SPEC-v0.10 §4.2 — which upstream this entry authorises itself against, or an empty pin.
+    upstream: UpstreamPin = field(default_factory=UpstreamPin)
     #: §7.3 — the control ids this action cites, which govern every rule under it.
     controls: tuple[str, ...] = ()
     #: §7.4 — which of this action's arguments carry which class of data.
     data: Mapping[str, DataLabel] = field(default_factory=dict)
+    #: SPEC-v0.7 §5.3 — how many attempts may execute on one effect key, the first included, or
+    #: `None` where the entry names no ceiling. `None` is today's behaviour and is not a number.
+    max_attempts: int | None = None
+    #: SPEC-v0.8 §4.2 — how many distinct verified principals must answer, or `None` where the
+    #: entry names none. `None` is one, which is 0.7.0.
+    approvals_required: int | None = None
+
+    def decisions(self) -> tuple[Decision, ...]:
+        """Every decision this entry can reach (SPEC-v0.8 §8.2.1).
+
+        One for a `decision:` entry, one per rule for a `rules:` entry. `Policy.approving_actions`
+        reads it to answer "does this action always go to a human", which is not the same as
+        "can it": an entry that approves under one condition and allows under another is a
+        policy whose change can be made without one.
+        """
+        if self.decision is not None:
+            return (self.decision,)
+        return tuple(rule.decision for rule in self.rules)
 
     def data_scope(self, arguments: Mapping[str, Any]) -> frozenset[str]:
         """The labels present in **the arguments actually supplied** (SPEC-v0.6 §7.4).
@@ -520,56 +474,6 @@ class _ActionPolicy:
         # No rule matched, so no rule's controls apply -- and the action's do: they govern
         # everything under it, including this refusal.
         return Evaluation(Decision.DENY, NO_MATCHING_RULE, _in_registry_order(self.controls, order))
-
-
-class _StrictLoader(yaml.SafeLoader):  # type: ignore[misc]  # PyYAML ships no stubs
-    """`yaml.SafeLoader` that refuses a repeated mapping key instead of resolving it.
-
-    YAML says a duplicated key is an error and PyYAML resolves it to the last one anyway,
-    silently. That is a fail-**open** in the authority document: a grant written as
-
-        actions: ["payments.refund"]
-        actions: ["**"]
-
-    -- the shape of a half-finished narrowing edit -- loads as `("**",)` with no warning, and
-    `ctrlrun verify` reads this same loader, so nothing downstream catches it either. Every
-    other mistake in these documents is refused, the key sets being closed at every level, so
-    a clean load reads as "the document is what I meant".
-
-    The node carries the line, which is exactly what the message needs.
-    """
-
-    def construct_mapping(
-        self,
-        node: Any,  # noqa: ANN401 - PyYAML's node type, and PyYAML ships no stubs
-        deep: bool = False,
-    ) -> dict[Any, Any]:
-        seen: set[Any] = set()
-        for key_node, _ in node.value:
-            key = self.construct_object(key_node, deep=True)
-            try:
-                duplicate = key in seen
-            except TypeError:  # an unhashable key; the base class refuses it below
-                continue
-            if duplicate:
-                mark = key_node.start_mark
-                raise yaml.constructor.ConstructorError(
-                    None,
-                    None,
-                    f"duplicate key {key!r} on line {mark.line + 1}, column {mark.column + 1}",
-                    mark,
-                )
-            seen.add(key)
-        return super().construct_mapping(node, deep)  # type: ignore[no-any-return]
-
-
-def strict_load(text: str, source: str) -> Any:  # noqa: ANN401 - any YAML scalar or node
-    """`yaml.safe_load`, refusing a repeated key. The one loader for every CTRLRun document."""
-    try:
-        # `_StrictLoader` derives from `SafeLoader`, so this constructs no arbitrary object.
-        return yaml.load(text, Loader=_StrictLoader)
-    except yaml.YAMLError as exc:
-        raise PolicyError(f"{source}: not valid YAML: {exc}") from exc
 
 
 @dataclass(frozen=True)
@@ -637,10 +541,10 @@ class Policy:
     @classmethod
     def from_yaml(cls, text: str, *, source: str = "<string>") -> Policy:
         """Parse and validate a policy document. Anything malformed raises `PolicyError`."""
-        return cls._from_document(strict_load(text, source), source)
+        return cls._from_document(strict_load(text, source), source, text)
 
     @classmethod
-    def _from_document(cls, document: object, source: str) -> Policy:
+    def _from_document(cls, document: object, source: str, text: str | None = None) -> Policy:
         if not isinstance(document, Mapping):
             raise PolicyError(
                 f"{source}: policy must be a mapping with 'schema' and 'actions' keys, "
@@ -673,19 +577,35 @@ class Policy:
             )
         mode = _parse_mode(document, source)
         require_v4(document, str(schema), source)
+        require_v7(document, str(schema), source)
         version = document.get("version")
         if "version" in document and (not isinstance(version, str) or not version.strip()):
             raise PolicyError(
                 f"{source}: 'version' must be a non-empty string, got {_type_name(version)}"
             )
-        controls = _parse_controls(document.get("controls"), source)
+        controls = _parse_controls(document.get("controls"), source, schema)
         actions: dict[str, _ActionPolicy] = {}
         for name, entry in entries.items():
             if not isinstance(name, str) or not name:
                 raise PolicyError(f"{source}: action names must be non-empty strings, got {name!r}")
+            if name == POLICY_CHANGE_ACTION and not _at_least(str(schema), POLICY_SCHEMA_V6):
+                # SPEC-v0.8 §8.2.1. An older reader would treat it as an ordinary action name
+                # and decide a policy change by whatever rule it found, with nothing saying the
+                # document meant the reserved one.
+                raise PolicyError(
+                    f"{source}: declaring {name!r} needs 'schema: {POLICY_SCHEMA_V6}'; this "
+                    f"document declares {schema!r}"
+                )
             actions[name] = _parse_entry(
-                entry, f"{source}: action {name!r}", str(schema), frozenset(controls)
+                entry,
+                f"{source}: action {name!r}",
+                str(schema),
+                frozenset(controls),
+                # SPEC-v0.7 §5.3 — the line a refused key sits on, recovered from the document's
+                # own marks and only where a refusal is about to name one.
+                line_of=partial(_entry_key_line, text, name),
             )
+        _reject_reserved_elsewhere(actions, source)
         return cls(
             actions=MappingProxyType(actions),
             source=source,
@@ -697,10 +617,84 @@ class Policy:
             _canonical=_canonical_policy(document, str(schema), mode, environment, source),
         )
 
+    def with_action(self, name: str, entry: Mapping[str, Any]) -> Policy:
+        """This policy plus one action entry, reparsed (SPEC-v0.8 §8.4, for `verify`).
+
+        Reparsed rather than mutated, because a `Policy` carries its own canonical form and a
+        mutated one would hash as the document it is not. Verify uses it to give G21 a
+        document that declares its own change: without that the enforcement's effect branch is
+        never reached, and the guarantee passes with the enforcement deleted.
+
+        **Verify's, and nothing else's.** A rule's conditions are dropped, which widens that
+        rule, and that is acceptable only because the result is a scratch document graded in a
+        scratch store and never anything an operator deploys.
+        """
+        import yaml
+
+        def rendered(policy: _ActionPolicy) -> dict[str, Any]:
+            """One entry, **including a `rules:` one**.
+
+            An earlier build emitted only `decision:` entries, so every rules-based action
+            disappeared from the rebuilt document and `evaluate` answered `unknown_action` for
+            it -- which G21 then reported as its failure, hiding what it was actually grading.
+            Conditions are not re-rendered: a rule keeps its decision and loses its `when`,
+            which is a **widening** of that rule and is why this is verify's only caller and
+            says so.
+            """
+            if policy.decision is not None:
+                return {"decision": str(policy.decision)}
+            return {"rules": [{"decision": str(rule.decision)} for rule in policy.rules]}
+
+        document: dict[str, Any] = {
+            "schema": POLICY_SCHEMA_V6,
+            "actions": {
+                **{action: rendered(policy) for action, policy in self.actions.items()},
+                name: dict(entry),
+            },
+        }
+        if self.environment is not None:
+            document["environment"] = self.environment
+        return Policy.from_yaml(yaml.safe_dump(document), source=f"{self.source} +{name}")
+
+    def approving_actions(self) -> frozenset[str]:
+        """The action names whose entry sends them to a human under every rule (§8.2.1).
+
+        Used by `Control` to answer "does this policy declare its own change as an approval",
+        which is the rule that stops an administrator writing a change rule of `allow`. An
+        entry with `rules:` counts only where **every** rule decides `approve`: one that
+        allows under some condition is a policy whose change can be made without a human under
+        that condition.
+        """
+        approving: set[str] = set()
+        for name, entry in self.actions.items():
+            decisions = entry.decisions()
+            if decisions and all(decision is Decision.APPROVE for decision in decisions):
+                approving.add(name)
+        return frozenset(approving)
+
     def data_scope(self, action: Action) -> frozenset[str]:
         """The set of data labels this action's supplied arguments carry (SPEC-v0.6 §7.4)."""
         entry = self.actions.get(action.name)
         return frozenset() if entry is None else entry.data_scope(action.canonical_arguments)
+
+    def upstream_pin(self, action_name: str) -> UpstreamPin:
+        """This action's upstream pin, or an empty one (SPEC-v0.10 §4.2).
+
+        An empty pin is satisfied by anything, which is every action entry written before v0.10
+        and why they all upgrade untouched.
+        """
+        entry = self.actions.get(action_name)
+        return UpstreamPin() if entry is None else entry.upstream
+
+    def tool_name(self, action_name: str) -> str | None:
+        """The upstream tool this action routes to, for §4.2's tool-schema pin.
+
+        The action name **is** the tool name at the gateway (`v0.2 §6.6` builds the Action from
+        `params.name`), so this is the identity today and exists as a name rather than as an
+        inlined assumption: a deployment that ever mapped one to the other would change here and
+        nowhere else.
+        """
+        return action_name if action_name in self.actions else None
 
     def effect_template(self, action_name: str) -> str | None:
         """This action's `effect:` template, or `None` (SPEC-v0.2 §3.1, §11).
@@ -720,6 +714,29 @@ class Policy:
         """This action's `mcp:` options, defaulting to the fail-closed ones (§3.1, §11)."""
         entry = self.actions.get(action_name)
         return _DEFAULT_MCP_OPTIONS if entry is None else entry.mcp
+
+    def approvals_required(self, action_name: str) -> int:
+        """How many distinct verified principals must answer this action (SPEC-v0.8 §4.2).
+
+        One where the entry names none, which is 0.7.0, and one for an action no entry names:
+        such an action is denied `unknown_action` before an approval exists, so the number is
+        never read.
+        """
+        entry = self.actions.get(action_name)
+        if entry is None or entry.approvals_required is None:
+            return 1
+        return entry.approvals_required
+
+    def max_attempts(self, action_name: str) -> int | None:
+        """This action's attempt ceiling, or `None` (SPEC-v0.7 §5.3).
+
+        `None` means the operator named no ceiling, which is 0.6.1's behaviour exactly: a renewal
+        over `FAILED` is admitted without bound (`v0.1 §5.4`). It is not a number and never
+        defaults to one, because any default would refuse at 0.7.0 a renewal that succeeded at
+        0.6.1, and would be a bound nobody chose (§5.4).
+        """
+        entry = self.actions.get(action_name)
+        return None if entry is None else entry.max_attempts
 
     def evaluate(self, action: Action) -> Evaluation:
         """Decide an action. No side effects; an unlisted action is denied (SPEC-v0.1 §3.4)."""
@@ -875,7 +892,7 @@ def _plain(value: object) -> PlainValue:
         # `yaml.safe_load` turns an unquoted `expires_at: 2020-01-01T00:00:00Z` into a
         # `datetime`, and such documents load today -- a grant with an expiry is the ordinary
         # case. ISO-8601 is what the same value would have been had it been quoted, and what
-        # CTRLRun writes everywhere else, so this loses nothing and invents nothing.
+        # ctrlrun writes everywhere else, so this loses nothing and invents nothing.
         #
         # An earlier version of this function *refused* here, which broke every authority
         # document with an unquoted expiry. The conformance kit's own `EXPIRED_GRANT` caught it.
@@ -900,25 +917,6 @@ def _plain(value: object) -> PlainValue:
     )
 
 
-def require_v3(document: Mapping[Any, Any], schema: str, source: str) -> None:
-    """Refuse a `ctrlrun.policy/v3` key in an older document (SPEC-v0.3 §12.1).
-
-    Shared with `authority.py`, which reads the same key from a document the policy loader
-    may never see: SPEC-v0.3 §8.3's `--authority` file carries `schema` and `authority` and
-    nothing else, so the check has to exist on both paths rather than on whichever runs first.
-    """
-    # v4 is a superset: a `v4` document may use every `v3` key. Comparing for equality here was
-    # right while v3 was the newest and becomes a bug the moment it is not.
-    if schema in (POLICY_SCHEMA_V3, POLICY_SCHEMA_V4):
-        return
-    for key, consequence in _V3_TOP_LEVEL_KEYS.items():
-        if key in document:
-            raise PolicyError(
-                f"{source}: {key!r} needs 'schema: {POLICY_SCHEMA_V3}'; this document "
-                f"declares {schema!r}, and {consequence}"
-            )
-
-
 def require_v4(document: Mapping[Any, Any], schema: str, source: str) -> None:
     """Refuse a `ctrlrun.policy/v4` key in an older document (SPEC-v0.6 §7.1).
 
@@ -928,7 +926,7 @@ def require_v4(document: Mapping[Any, Any], schema: str, source: str) -> None:
     check at all" and "an older reader would refuse the document outright" call for different
     reactions.
     """
-    if schema == POLICY_SCHEMA_V4:
+    if _at_least(schema, POLICY_SCHEMA_V4):
         return
     for key, consequence in _V4_TOP_LEVEL_KEYS.items():
         if key in document:
@@ -955,47 +953,6 @@ def _parse_mode(document: Mapping[Any, Any], source: str) -> Literal["observe", 
             "There is one switch and it governs the process (SPEC-v0.3 §6.1)"
         )
     return OBSERVE if value == OBSERVE else ENFORCE
-
-
-def reject_nested_mode(mapping: Mapping[Any, Any], where: str) -> None:
-    """Refuse a `mode:` anywhere but the top level of the policy document (SPEC-v0.3 §6.1).
-
-    The closed key sets of `v0.1 §3.1` would already refuse it as unknown, wherever they
-    reach. This runs first and for its *message*: "unknown key 'mode'" reads as "CTRLRun has
-    no such setting", and the author who wrote it here believes they have observed one action
-    while enforcing the rest. A partially-enforced configuration is the failure mode the
-    top-level-only rule exists to prevent, so the error says which rule was broken.
-
-    Shared with `authority.py`, which owns the two nestings inside an `authority:` section and
-    parses documents the policy loader never reads (§4.8).
-    """
-    if MODE_KEY in mapping:
-        raise PolicyError(
-            f"{where}: 'mode' is top level and nothing else (SPEC-v0.3 §6.1). A configuration "
-            "where some actions are observed and some are enforced is one where nobody can say "
-            "whether an action was permitted or merely watched; move it beside 'schema:'"
-        )
-
-
-def parse_conditions(
-    mapping: Mapping[Any, Any], *, where: str, allow_derived: bool = False
-) -> Mapping[str, Condition]:
-    """Parse a `when:`-shaped mapping into conditions, keyed by the raw condition key.
-
-    Public since SPEC-v0.3 §11: a grant's `constraints:` is in exactly this syntax and MUST be
-    parsed by this code (§4.5). The key is injective given §3.2's longest-suffix split, which
-    is what lets `Grant`'s containment check look a dimension up by name.
-
-    `allow_derived` admits §7.4's derived subjects and **defaults to off**, so `authority.py` --
-    which calls this without it — sees exactly the surface it saw in v0.3. A grant naming
-    `data_scope` is refused as it always was, which is what keeps §11's *"matching a grant on a
-    data label"* out of v0.6 rather than letting it in through a shared parser.
-    """
-    conditions: dict[str, Condition] = {}
-    for key, operand in mapping.items():
-        condition = _parse_condition(key, operand, where, allow_derived)
-        conditions[condition.key] = condition
-    return conditions
 
 
 def _reject_unknown_keys(mapping: Mapping[Any, Any], allowed: Iterable[str], where: str) -> None:
@@ -1037,7 +994,7 @@ def _checked_control_id(identifier: str, source: str) -> None:
         )
 
 
-def _parse_controls(value: object, source: str) -> dict[str, PolicyControl]:
+def _parse_controls(value: object, source: str, schema: str) -> dict[str, PolicyControl]:
     """The top-level `controls:` registry (SPEC-v0.6 §7.3)."""
     if value is None:
         return {}
@@ -1066,8 +1023,33 @@ def _parse_controls(value: object, source: str) -> dict[str, PolicyControl]:
             raise PolicyError(
                 f"{where}: 'source' must be a non-empty string, got {_type_name(cited)}"
             )
+        role = entry.get("approver_role")
+        if "approver_role" in entry:
+            if not _at_least(schema, POLICY_SCHEMA_V6):
+                raise PolicyError(
+                    f"{where}: 'approver_role' needs 'schema: {POLICY_SCHEMA_V6}'; this document "
+                    f"declares {schema!r}, and an older reader would load it, gate nobody, and "
+                    "report a deployment as checking entitlement when it is not"
+                )
+            if not isinstance(role, str) or not role.strip():
+                raise PolicyError(
+                    f"{where}: 'approver_role' must be a non-empty string, got {_type_name(role)}"
+                )
+            if role != role.strip():
+                # Refused rather than trimmed, because §3.4 matches a role against a claim byte
+                # for byte: trimming here would make the document and the comparison disagree,
+                # and accepting it as written means a role nobody's credential can ever carry,
+                # which refuses every approval the control gates and says nothing about why.
+                raise PolicyError(
+                    f"{where}: 'approver_role' has leading or trailing whitespace ({role!r}); "
+                    "roles are matched byte for byte against a claim, so this one would match "
+                    "nothing and refuse every approval this control gates"
+                )
         registry[identifier] = PolicyControl(
-            id=identifier, title=title, source=cited if isinstance(cited, str) else None
+            id=identifier,
+            title=title,
+            source=cited if isinstance(cited, str) else None,
+            approver_role=role if isinstance(role, str) else None,
         )
     return registry
 
@@ -1147,8 +1129,143 @@ def _parse_cited(value: object, where: str, known: frozenset[str]) -> tuple[str,
     return tuple(cited)
 
 
+def _reject_reserved_elsewhere(actions: Mapping[str, _ActionPolicy], source: str) -> None:
+    """SPEC-v0.8 §8.2.1: nothing else may name the reserved action as a resource or an effect.
+
+    The name is what gates the exemption in §8.4 and the marker in §8.2.1, and a document that
+    could make an ordinary action expand to `policy:<hash>` -- or render `ctrlrun.policy.change`
+    as its resource -- would be a document that could mint the marker of an approved policy from
+    an action nobody reviewed as one. Matched as a substring of the template, because a
+    template is expanded later and a placeholder could otherwise carry the name in.
+    """
+    for name, entry in actions.items():
+        if name == POLICY_CHANGE_ACTION:
+            continue
+        for label, template in (("resource", entry.resource), ("effect", entry.effect)):
+            if template is not None and POLICY_CHANGE_ACTION in template:
+                raise PolicyError(
+                    f"{source}: action {name!r} names {POLICY_CHANGE_ACTION!r} in its "
+                    f"{label!r} template. That name is reserved for the policy-change flow "
+                    "(SPEC-v0.8 §8.2.1), and an action that could expand to it would be a way "
+                    "to mark a policy approved without proposing one"
+                )
+        if entry.effect is not None and entry.effect.startswith("policy:"):
+            raise PolicyError(
+                f"{source}: action {name!r} declares an 'effect:' template beginning 'policy:', "
+                "which is the effect key a policy approval is recorded under (SPEC-v0.8 §8.4). "
+                "An action reserving that key could mark a policy approved"
+            )
+
+
+def _parse_upstream(value: object, where: str) -> UpstreamPin:
+    """SPEC-v0.10 §4.2. Refuse what the pin cannot mean, at load, where an operator is present.
+
+    A malformed pin is a `PolicyError` and never a pin that quietly matches nothing: a key whose
+    typo turns it off is the fail-open direction, and §4.5's whole point is that an unverified
+    upstream refuses rather than passes.
+    """
+    if value is None:
+        return UpstreamPin()
+    if not isinstance(value, Mapping):
+        raise PolicyError(f"{where}: 'upstream' must be a mapping")
+    unknown = set(value) - _UPSTREAM_KEYS
+    if unknown:
+        raise PolicyError(
+            f"{where}: unknown 'upstream' key(s) {sorted(unknown)!r}; the pin's keys are "
+            f"{sorted(_UPSTREAM_KEYS)!r} (SPEC-v0.10 §4.2)"
+        )
+    digests = value.get("tls_cert_sha256", [])
+    if isinstance(digests, str):
+        digests = [digests]
+    if not isinstance(digests, list) or not all(isinstance(item, str) for item in digests):
+        raise PolicyError(
+            f"{where}: 'upstream.tls_cert_sha256' must be a list of 'sha256:…' strings; it is a "
+            "LIST so an operator can carry the current and the next certificate across a "
+            "rotation without an outage (SPEC-v0.10 §4.2)"
+        )
+    for digest in digests:
+        if not _SHA256.match(digest):
+            raise PolicyError(
+                f"{where}: 'upstream.tls_cert_sha256' entry {digest!r} is not 'sha256:' "
+                "followed by 64 hex characters"
+            )
+    files = value.get("tls_cert_file", [])
+    if isinstance(files, str):
+        files = [files]
+    if not isinstance(files, list) or not all(isinstance(item, str) for item in files):
+        raise PolicyError(f"{where}: 'upstream.tls_cert_file' must be a path or a list of paths")
+    schema_hash = value.get("tool_schema_sha256")
+    if schema_hash is not None and (
+        not isinstance(schema_hash, str) or not _SHA256.match(schema_hash)
+    ):
+        raise PolicyError(
+            f"{where}: 'upstream.tool_schema_sha256' must be 'sha256:' followed by 64 hex chars"
+        )
+    pin = UpstreamPin(
+        cert_sha256=tuple(digests), certs=tuple(files), tool_schema_sha256=schema_hash
+    )
+    _check_pin_correspondence(pin, where)
+    return pin
+
+
+def _check_pin_correspondence(pin: UpstreamPin, where: str) -> None:
+    """The two TLS halves must agree, checked at load (SPEC-v0.10 §4.2).
+
+    §4.2 measured what a half-moved rotation costs and then this check was not written, which an
+    independent review found: a document whose `tls_cert_file` still held only the old certificate
+    while `tls_cert_sha256` had both loaded cleanly and failed at the **handshake**, on the day an
+    operator believed they had prepared for. That is the outage §4.2 says the list prevents,
+    arriving one layer down.
+
+    So: every certificate `tls_cert_file` holds hashes to a digest `tls_cert_sha256` names, and a
+    path that does not exist is a load error rather than an empty trust store discovered at the
+    first connection.
+    """
+    if not pin.certs:
+        return
+    import hashlib
+    import ssl
+
+    for path in pin.certs:
+        try:
+            der_list = [
+                ssl.PEM_cert_to_DER_cert(block + "-----END CERTIFICATE-----")
+                for block in Path(path).read_text().split("-----END CERTIFICATE-----")
+                if "BEGIN CERTIFICATE" in block
+            ]
+        except OSError as unreadable:
+            raise PolicyError(
+                f"{where}: 'upstream.tls_cert_file' names {path!r}, which could not be read "
+                f"({unreadable.strerror}); a pin whose certificate is missing builds an empty "
+                "trust store and refuses every connection (SPEC-v0.10 §4.2)"
+            ) from unreadable
+        except ValueError as malformed:
+            raise PolicyError(
+                f"{where}: 'upstream.tls_cert_file' names {path!r}, which is not PEM: {malformed}"
+            ) from malformed
+        if not der_list:
+            raise PolicyError(
+                f"{where}: 'upstream.tls_cert_file' names {path!r}, which holds no certificate"
+            )
+        if not pin.cert_sha256:
+            continue
+        digests = {"sha256:" + hashlib.sha256(der).hexdigest() for der in der_list}
+        if not digests & set(pin.cert_sha256):
+            raise PolicyError(
+                f"{where}: 'upstream.tls_cert_file' {path!r} hashes to "
+                f"{sorted(digests)[0]}, which 'upstream.tls_cert_sha256' does not name. The two "
+                "halves pin the same certificates or a rotation that moves one fails at the "
+                "handshake (SPEC-v0.10 §4.2)"
+            )
+
+
 def _parse_entry(
-    entry: object, where: str, schema: str, known: frozenset[str] = frozenset()
+    entry: object,
+    where: str,
+    schema: str,
+    known: frozenset[str] = frozenset(),
+    *,
+    line_of: Callable[[str], int | None] = lambda key: None,
 ) -> _ActionPolicy:
     if not isinstance(entry, Mapping):
         raise PolicyError(
@@ -1168,12 +1285,33 @@ def _parse_entry(
 
     cited = _parse_cited(entry.get("controls"), where, known)
     for key, consequence in _V4_ENTRY_KEYS.items():
-        if key in entry and schema != POLICY_SCHEMA_V4:
+        if key in entry and not _at_least(schema, POLICY_SCHEMA_V4):
             raise PolicyError(
                 f"{where}: {key!r} needs 'schema: {POLICY_SCHEMA_V4}'; this document declares "
                 f"{schema!r}, and {consequence}"
             )
+    for key, consequence in _V5_ENTRY_KEYS.items():
+        if key in entry and not _at_least(schema, POLICY_SCHEMA_V5):
+            raise PolicyError(
+                f"{where}: {key!r}{_at_line(line_of(key))} needs 'schema: {POLICY_SCHEMA_V5}'; "
+                f"this document declares {schema!r}, and {consequence}"
+            )
+    for key, consequence in _V6_ENTRY_KEYS.items():
+        if key in entry and not _at_least(schema, POLICY_SCHEMA_V6):
+            raise PolicyError(
+                f"{where}: {key!r}{_at_line(line_of(key))} needs 'schema: {POLICY_SCHEMA_V6}'; "
+                f"this document declares {schema!r}, and {consequence}"
+            )
+    for key, consequence in _V8_ENTRY_KEYS.items():
+        if key in entry and not _at_least(schema, POLICY_SCHEMA_V8):
+            raise PolicyError(
+                f"{where}: {key!r}{_at_line(line_of(key))} needs 'schema: {POLICY_SCHEMA_V8}'; "
+                f"this document declares {schema!r}, and {consequence}"
+            )
     labels = _parse_data(entry.get("data"), where)
+    pin = _parse_upstream(entry.get("upstream"), where)
+    ceiling = _parse_max_attempts(entry, where, line_of)
+    required = _parse_approvals_required(entry, where, line_of)
 
     if has_decision:
         return _ActionPolicy(
@@ -1182,8 +1320,11 @@ def _parse_entry(
             effect=effect,
             resource=resource,
             mcp=mcp,
+            upstream=pin,
             controls=cited,
             data=MappingProxyType(labels),
+            max_attempts=ceiling,
+            approvals_required=required,
         )
 
     rules = entry["rules"]
@@ -1197,9 +1338,119 @@ def _parse_entry(
         effect=effect,
         resource=resource,
         mcp=mcp,
+        upstream=pin,
         controls=cited,
         data=MappingProxyType(labels),
+        max_attempts=ceiling,
+        approvals_required=required,
     )
+
+
+def _at_line(line: int | None) -> str:
+    """` on line N`, or nothing where the document's marks could not be recovered."""
+    return "" if line is None else f" on line {line}"
+
+
+def _parse_approvals_required(
+    entry: Mapping[Any, Any], where: str, line_of: Callable[[str], int | None]
+) -> int | None:
+    """The M-of-N threshold, validated at load (SPEC-v0.8 §4.2).
+
+    `v0.7 §5.3`'s rules for `max_attempts`, for the same reason: a document that cannot say how
+    many approvals it requires is a document nobody should deploy, and finding out when the first
+    grant consumes is finding out late.
+
+    `bool` is refused although Python makes it an `int` (`v0.1 §3.2`). `0` is refused rather than
+    read as "no approval needed", which is what `decision: allow` says, or as "never", which is
+    `decision: deny`. Absent means 1, which is 0.7.0.
+    """
+    if "approvals_required" not in entry:
+        return None
+    value = entry["approvals_required"]
+    at = _at_line(line_of("approvals_required"))
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PolicyError(
+            f"{where}: 'approvals_required'{at} must be an integer of at least 1, got "
+            f"{_type_name(value)} {value!r}. It counts the distinct verified principals that "
+            "must answer; remove the key for one"
+        )
+    if value < 1:
+        raise PolicyError(
+            f"{where}: 'approvals_required'{at} must be at least 1, got {value}. Zero approvals "
+            "is 'decision: allow', and an action nobody may approve is 'decision: deny'"
+        )
+    return value
+
+
+def _parse_max_attempts(
+    entry: Mapping[Any, Any], where: str, line_of: Callable[[str], int | None]
+) -> int | None:
+    """The attempt ceiling, validated at load (SPEC-v0.7 §5.3).
+
+    **At load, and naming the key, the action and the line**, so a malformed ceiling fails the
+    policy rather than the execution: a document that cannot say how many attempts it permits is
+    a document nobody should deploy, and finding out at the fourth dispatch is finding out late.
+
+    `bool` is refused although Python makes it an `int` (`v0.1 §3.2`): `max_attempts: true` is a
+    typo for a number and not a ceiling of one. `0` is refused rather than read as "unlimited"
+    (`v0.7 §1.1`: no value of this key relaxes it) or as "never run" (`max_attempts` counts what
+    executes, and an action that may never execute is a `decision: deny`). There is no upper
+    bound: a very large ceiling is the operator's statement that they meant it.
+    """
+    if "max_attempts" not in entry:
+        return None
+    value = entry["max_attempts"]
+    at = _at_line(line_of("max_attempts"))
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PolicyError(
+            f"{where}: 'max_attempts'{at} must be an integer of at least 1, got "
+            f"{_type_name(value)} {value!r}. It counts the attempts that may execute on one "
+            "effect key, the first included; remove the key for no ceiling"
+        )
+    if value < 1:
+        raise PolicyError(
+            f"{where}: 'max_attempts'{at} must be an integer of at least 1, got {value!r}. "
+            "It counts the attempts that may execute on one effect key, the first included, so "
+            "there is no ceiling below 1; remove the key for no ceiling"
+        )
+    return value
+
+
+def _entry_key_line(text: str | None, action: str, key: str) -> int | None:
+    """The 1-based line `actions: <action>: <key>:` sits on, or `None`.
+
+    Composed on demand, on the refusal path only, rather than carried through the parse: the
+    loader hands `_parse_entry` a plain document, and PyYAML drops a node's marks the moment it
+    constructs one. Composing again reads the same text with the same loader and asks it for the
+    one mark the message needs, at the cost of a second parse of a document that is about to be
+    refused. `_StrictLoader.construct_mapping` never runs here, so the duplicate-key refusal is
+    unaffected either way: that one already fired, in `strict_load`, before this could.
+    """
+    if text is None:
+        return None
+    try:
+        root = yaml.compose(text, Loader=_StrictLoader)
+    except (yaml.YAMLError, ValueError, OverflowError):  # pragma: no cover - strict_load ran first
+        return None
+    node = _child(_child(root, "actions"), action)
+    found = None if node is None else _key_node(node, key)
+    return None if found is None else int(found.start_mark.line) + 1
+
+
+def _child(node: Any, key: str) -> Any:  # noqa: ANN401 - PyYAML ships no stubs
+    found = _key_node(node, key)
+    if found is None:
+        return None
+    return next(value for name, value in node.value if name is found)
+
+
+def _key_node(node: Any, key: str) -> Any:  # noqa: ANN401 - PyYAML ships no stubs
+    if not isinstance(node, yaml.MappingNode):
+        return None
+    for name, _ in node.value:
+        if isinstance(name, yaml.ScalarNode) and name.value == key:
+            return name
+    return None
 
 
 def _reject_v2_keys_under_v1(entry: Mapping[Any, Any], where: str, schema: str) -> None:
@@ -1247,7 +1498,7 @@ def _parse_mcp(value: object, where: str) -> McpOptions:
     _reject_unknown_keys(value, _MCP_KEYS, f"{where}: mcp")
     claimed = value.get("not_executed_on_error", False)
     # SPEC-v0.2 §3.1 — a bool, and `1` is not one. This is an assertion about a remote that
-    # CTRLRun cannot check (§6.8), so it is made deliberately or not at all.
+    # ctrlrun cannot check (§6.8), so it is made deliberately or not at all.
     if not isinstance(claimed, bool):
         raise PolicyError(
             f"{where}: mcp: 'not_executed_on_error' must be true or false, "
@@ -1291,110 +1542,4 @@ def _parse_rule(rule: object, where: str, known: frozenset[str] = frozenset()) -
         decision=decision,
         conditions=tuple(parse_conditions(when, where=where, allow_derived=True).values()),
         controls=cited,
-    )
-
-
-def _parse_condition(
-    key: object, operand: object, where: str, allow_derived: bool = False
-) -> Condition:
-    if not isinstance(key, str):
-        raise PolicyError(f"{where}: condition keys must be strings, got {key!r}")
-    argument, op = _split_condition_key(key, where, allow_derived)
-    return Condition(
-        key=key,
-        argument=argument,
-        op=op,
-        operand=_parse_operand(op, operand, where, key),
-    )
-
-
-def _split_condition_key(key: str, where: str, allow_derived: bool = False) -> tuple[str, str]:
-    for op in _OPERATORS_BY_LENGTH:
-        suffix = f"_{op}"
-        if key.endswith(suffix) and len(key) > len(suffix):
-            argument = key[: -len(suffix)]
-            if argument in DERIVED_SUBJECTS and allow_derived:
-                return argument, op
-            if argument in DERIVED_SUBJECTS:
-                # Reached only where derived subjects are not admitted -- an authority
-                # `constraints:` mapping. §11 puts *"matching a grant on a data label"* out of
-                # v0.6, and the message says which surface refused it rather than claiming the
-                # name is an `Action` field, which `data_scope` is not.
-                raise PolicyError(
-                    f"{where}: condition {key!r} addresses {argument!r}, which a policy rule may "
-                    f"see and a grant may not. Matching a grant on {argument!r} is not in v0.6; "
-                    "write the rule in the policy instead."
-                )
-            if argument in RESERVED_ARGUMENTS:
-                raise PolicyError(
-                    f"{where}: condition {key!r} names the Action field {argument!r}, not an "
-                    "argument; a v0.1 condition can only address the action's arguments, so "
-                    "this rule would never match. If the protected function really does take "
-                    f"an argument called {argument!r}, rename it."
-                )
-            return argument, op
-    raise PolicyError(
-        f"{where}: condition {key!r} must be '<argument>_<op>' where op is one of "
-        f"{', '.join(sorted(_OPERATORS))}"
-    )
-
-
-def _parse_operand(op: str, operand: object, where: str, key: str) -> object:
-    if op in _NUMERIC_COMPARE:
-        if not _is_int(operand):
-            # SPEC-v0.3 §4.5 — the message names the representation rule, because the operator
-            # who wrote `amount_lte: "2000.00"` has hit a real limit and not a typo: only
-            # integer arguments can be bounded, so a deployment representing money as decimal
-            # strings cannot express an amount ceiling in a grant at all.
-            raise PolicyError(
-                f"{where}: condition {key!r}: a numeric operator needs an int operand, "
-                f"got {_type_name(operand)}. Only integers can be bounded, so an amount that "
-                "a rule or a grant compares is written in integer minor units "
-                "(amount_lte: 200000), never as a decimal string"
-            )
-        return operand
-    if op == "in":
-        if not isinstance(operand, list):
-            raise PolicyError(
-                f"{where}: condition {key!r}: '_in' needs a list operand, got {_type_name(operand)}"
-            )
-        return tuple(_checked_operand(item, where, key) for item in operand)
-    checked = _checked_operand(operand, where, key)
-    if op in {"eq", "neq"} and isinstance(checked, list | tuple):
-        # A derived, set-valued subject is compared with `frozenset(...)`, so every element
-        # has to be hashable. `data_scope_eq: [[phi]]` used to load clean and then raise
-        # `TypeError: unhashable type: 'list'` on every evaluation of the action -- out of
-        # `Control.execute`, and not as a `CTRLRunError`, so an application catching the
-        # kernel's own errors did not catch it. Refuse here, where the message can name the
-        # condition and the operator can find the line.
-        for item in checked:
-            if isinstance(item, list | tuple | Mapping):
-                raise PolicyError(
-                    f"{where}: condition {key!r}: a set-valued operand holds strings, "
-                    f"got {_type_name(item)}. Write the labels as a flat list "
-                    "(data_scope_eq: [phi, pci]), not nested"
-                )
-    return checked
-
-
-def _checked_operand(operand: object, where: str, key: str) -> object:
-    """Validate an operand against the argument types allowed by SPEC-v0.1 §2.3."""
-    if isinstance(operand, float):
-        raise PolicyError(
-            f"{where}: condition {key!r}: float operands are not allowed; use integer minor "
-            "units (amount_lte: 50000) or a decimal string"
-        )
-    if operand is None or isinstance(operand, str | int):  # bool is a subclass of int
-        return operand
-    if isinstance(operand, Mapping):
-        for name in operand:
-            if not isinstance(name, str):
-                raise PolicyError(
-                    f"{where}: condition {key!r}: operand keys must be strings, got {name!r}"
-                )
-        return {name: _checked_operand(value, where, key) for name, value in operand.items()}
-    if isinstance(operand, list):
-        return [_checked_operand(item, where, key) for item in operand]
-    raise PolicyError(
-        f"{where}: condition {key!r}: {_type_name(operand)} is not an allowed operand type"
     )

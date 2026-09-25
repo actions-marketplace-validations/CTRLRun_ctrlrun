@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """Concurrency and failure injection against a real Postgres. Item 4; SPEC-v0.6 §4.5, §8.
 
 **What was run, stated first, because §4.5 requires the PR to say so.** These are separate OS
@@ -53,6 +55,12 @@ import pytest
 from ctrlrun.effect import EffectState
 from ctrlrun.errors import AmbiguousEffect, CTRLRunError, DuplicateEffect, NotExecuted
 from failure_injection import Proxy, upstream_of
+
+#: Every window in this file is opened by the proxy -- the killed COMMIT and the partition --
+#: and measured against what a store did inside it. Sharing a machine with seven other pytest
+#: workers turns those into races the test loses: T155b reported "the window never opened",
+#: which was true. `scripts/check.sh` runs these on their own.
+pytestmark = pytest.mark.serial
 
 URL = os.environ.get("CTRLRUN_TEST_POSTGRES")
 

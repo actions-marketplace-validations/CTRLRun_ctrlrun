@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     # SPEC-v0.6 §4. The Postgres tests skip when CTRLRUN_TEST_POSTGRES is unset, and a
     # skipping test proves nothing -- so CI supplies a real server rather than letting the
@@ -48,11 +48,15 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install
+        # Every dependency by hash from `requirements/ci.txt`, then the checkout itself with
+        # `--no-deps` and against the backend that lock carries (`requirements/in/backend.in`):
+        # what this job resolves is what `scripts/lock.sh` wrote down and somebody reviewed, not
+        # what PyPI happened to serve this morning. The gateway's tests need its
+        # extra; T30 still proves `import ctrlrun` does not touch it, in a subprocess, whether
+        # or not it happens to be installed here.
         run: |
-          python -m pip install --upgrade pip
-          # The gateway's tests need its extra; T30 still proves `import ctrlrun` does not
-          # touch it, in a subprocess, whether or not it happens to be installed here.
-          pip install -e ".[dev,gateway,otel,identity,postgres]"
+          pip install --require-hashes -r requirements/ci.txt
+          pip install --no-deps --no-build-isolation -e .
 
       # A claim about the environment is worth nothing until something checks it: if the
       # service failed to start, the Postgres tests would silently skip and the backend
@@ -76,21 +80,16 @@ jobs:
       - name: check
         env:
           CTRLRUN_REQUIRE_RELEASE_FIXTURES: "1"
+          # Measured on one version only; the number is the same on every version, and the
+          # measuring is not free.
+          CTRLRUN_COVERAGE: ${{ matrix.python-version == '3.12' && '1' || '' }}
         run: ./scripts/check.sh
 
-      # The badge is written **after** `check.sh`, and the order is the whole claim: a count
-      # produced before the run would be the size of a suite that might be red. It is uploaded
-      # from one matrix leg only — two would race for the same artifact name — and published by
-      # the `badge` job, which runs on a push to `main` and on nothing else.
-      - name: The test-count badge
-        if: matrix.python-version == '3.11'
-        run: python tools/docs_audit/render_badges.py --write-count tests-badge.json
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: matrix.python-version == '3.11'
-        with:
-          name: ctrlrun-tests-badge
-          path: tests-badge.json
+      # CONTRIBUTING.md states the floors; this is what holds them. A drop below either one is
+      # a red check on the pull request that caused it, not a number somebody notices later.
+      - name: Coverage floors
+        if: matrix.python-version == '3.12'
+        run: python scripts/coverage_floor.py coverage.json --statements 90 --branches 80
 
   # SPEC-v0.4 §5, T118. The composite action, run against this repository's own
   # configurations, with `install: .` so it dogfoods the checkout rather than the last
@@ -134,10 +133,27 @@ jobs:
           set -eu
           echo "authority: $AUTHORITY ($AUTHORITY_NA not applicable)"
           echo "templates: $TEMPLATES ($TEMPLATES_NA not applicable)"
-          test "$AUTHORITY" = "verified 11/11"
-          test "$AUTHORITY_NA" = "0"
-          test "$TEMPLATES" = "verified 6/6"
-          test "$TEMPLATES_NA" = "5"
+          test "$AUTHORITY" = "verified 29/29"
+          # G13 is N/A on SQLite, the action's default store: SQLite has no clock of its own
+          # to diverge from; G15 is N/A because neither document declares `max_attempts`.
+          # G16 is graded on both: verify brings its own precondition provider (SPEC-v0.7 §8.9).
+          # G17 is N/A on both since v0.8 item 3: neither document names an
+          # `approver_role`, which is a statement about what the operator wrote
+          # (SPEC-v0.8 §3.5, §11.7). G18 is graded since item 2, which supplies its
+          # own approver identity: whether
+          # an operator configured one is a fact about their application and never an N/A
+          # reason here (SPEC-v0.8 §11.7). Both counts moved by one when it landed.
+          #
+          # SPEC-v0.9 §6 moved the templates count again: G24 is N/A for a document whose
+          # grants name no task, which the templates example's do not. The authority example
+          # binds one, so its count is unchanged and its passing total moved 19 to 20 instead.
+          test "$AUTHORITY_NA" = "3"
+          #
+          # SPEC-v0.11 §8 moved the templates count again: G31 needs only an action to
+          # build a chain from, so it is graded wherever any guarantee is, and both
+          # examples gained one passing row when item 4 landed.
+          test "$TEMPLATES" = "verified 16/16"
+          test "$TEMPLATES_NA" = "16"
           test -s verify-badge.json
           test -s verify-report.json
           test -s verify-report.xml
@@ -157,11 +173,20 @@ jobs:
   #     rather than regenerated. §5.1's rule holds across the job boundary: the badge, the job
   #     summary and the uploaded report all come from one verify run.
   badge:
-    needs: [verify, check]
+    # `docs` as well as the two it always needed: the test-count artifact is produced there
+    # now, and a `badge` job that did not wait for it would download nothing and publish a
+    # stale count -- or fail on a race, which is the same bug on a good day.
+    needs: [verify, check, docs]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # Shared, verbatim, with the `clones` job in `traffic.yml`: the two publishers of the
+    # `badges` branch. Without it both can fetch the same head, and the second push is rejected
+    # as a non-fast-forward -- which shows up as a badge that quietly stopped moving.
+    concurrency:
+      group: badges-branch
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -230,10 +255,9 @@ jobs:
         # test must be this checkout, so its dependencies are installed on the line above and
         # the adapters are installed against it.
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,gateway,otel,identity]"
-          pip install langgraph langchain langchain-openai openai-agents
-          pip install --no-deps -e adapters/langgraph -e adapters/openai-agents
+          pip install --require-hashes -r requirements/adapters.txt
+          pip install --no-deps --no-build-isolation -e .
+          pip install --no-deps --no-build-isolation -e adapters/langgraph -e adapters/openai-agents
 
       # The frameworks are installed, so a skip here is a failure and not a configuration.
       # `-p no:randomly` is not used and no marker is filtered: this is the whole of both files.
@@ -258,22 +282,70 @@ jobs:
           assert skipped == 0, f"{skipped} adapter tests skipped; the frameworks did not install"
           PY
 
-  # The documentation audit (docs/STYLE.md). One job of its own so a docs PR gets a docs answer,
-  # and every step in it is now a hard failure:
+  # The documentation audit, and the test-count badge that only a green suite may produce.
   #
-  #   - nine generators, each with `--check`, so no rendered table, reference page, recipe
-  #     directory, readiness block, badge row or study table can be hand-edited;
-  #   - runnable snippets, the forbidden-words lint and the link check.
+  # The pages moved to `CTRLRun/ctrlrun-docs`, and the checks moved with them -- but what they
+  # check is *this* commit, so the job runs them there against a checkout of here. One
+  # implementation of every rule, two triggers: this job on a change to the library, and that
+  # repository's own CI on a change to a page. Which checkout of there is decided below: the
+  # branch named after this one when there is one, and `main` otherwise.
   #
-  # The last three carried `continue-on-error: true` from session 0 to session 6. They were
-  # wired in against the documentation as it stood, and the findings they raised that day were
-  # the baseline the writing sessions had to clear; a job that was red on arrival would have
-  # taught everyone to ignore it. The baseline is clear, so the flags are gone -- a red step
-  # that is allowed to be red is documentation, not a guard.
+  # Every step is a hard failure. Three of them carried `continue-on-error: true` from session
+  # 0 to session 6, while a baseline nobody had cleared yet would have made the job red on
+  # arrival and taught everyone to ignore it. The baseline is clear, so the flags are gone: a
+  # red step that is allowed to be red is documentation, not a guard.
   docs:
+    # **The badge below is the reason for this dependency, and the dependency is the claim.**
+    # `--write-count` publishes the size of the suite, and a count produced before the suite
+    # ran would be the size of a run that might be red. It used to be a later *step* in the
+    # same job as `check.sh`; the audit lives in another repository now, so the ordering is a
+    # job dependency instead -- which is the stronger form, because a step's ordering is a
+    # convention and `needs:` is enforced.
+    needs: check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ctrlrun
+
+      # The pages are rendered from this commit's docstrings and `--help`, so a commit that
+      # changes either has changed a page, and the two land as a pair: a branch here that
+      # alters a signature is accompanied by a branch of the same name there, regenerated
+      # against it, and each is checked against the other. `main` is checked against `main`,
+      # so the pages there match the library's `main` at all times, and the docs branch merges
+      # when the kernel branch does.
+      #
+      # Before this every branch was checked against that repository's `main`, and a page could
+      # not be regenerated until the commit it describes had merged, so every pull request that
+      # touched a docstring was red by construction -- eleven runs in a row from the first v0.10
+      # item -- and a check that is always red is a check nobody reads. The fallback is `main`
+      # and not a skip, for the reason the flags above are gone: a branch that forgot its pages
+      # is a red job, not a green one that verified nothing.
+      #
+      # The branch name reaches the shell through `env:`, never inline in the script, so a
+      # branch called `$(...)` is a string here and not a command. The comparison is exact and
+      # fixed-string: `ls-remote` matches a pattern against the tail of a ref, and `.` in a
+      # version would be a regex wildcard.
+      - name: Pick the ctrlrun-docs ref
+        id: docs
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -eu
+          if git ls-remote --heads https://github.com/CTRLRun/ctrlrun-docs.git "refs/heads/$BRANCH" \
+              | cut -f2 | grep -qxF "refs/heads/$BRANCH"; then
+            echo "ref=$BRANCH" >> "$GITHUB_OUTPUT"
+            echo "ctrlrun-docs at $BRANCH, the branch of the same name"
+          else
+            echo "ref=main" >> "$GITHUB_OUTPUT"
+            echo "ctrlrun-docs at main: it has no branch named $BRANCH"
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: CTRLRun/ctrlrun-docs
+          ref: ${{ steps.docs.outputs.ref }}
+          path: ctrlrun-docs
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -282,50 +354,85 @@ jobs:
       - name: Install
         # Every extra: a runnable guide block that exports to OpenTelemetry or opens the
         # gateway's client needs the extra installed, and a block that skipped would be a
-        # sample nobody ran.
+        # sample nobody ran. `postgres` too, for a different reason: the readiness block records
+        # what `pytest --collect-only` finds, and 76 tests are collected only when psycopg is
+        # importable. `docs.txt` therefore locks the same extras `ci.txt` does, and
+        # `test_the_docs_lock_covers_the_suite_the_check_job_runs` holds the two together.
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,gateway,otel,identity]"
+          pip install --require-hashes -r ctrlrun/requirements/docs.txt
+          pip install --no-deps --no-build-isolation -e ./ctrlrun
 
-      - name: Rendered capability tables match docs/capabilities.yaml
-        run: python tools/docs_audit/render_capabilities.py --check
+      # `_core.py` raises when it cannot find the library, so this prints a path or the job
+      # stops here. A documentation check that ran against no source would be green and
+      # would have verified nothing.
+      - name: The audit can see this checkout
+        working-directory: ctrlrun-docs
+        env:
+          CTRLRUN_SOURCE: ${{ github.workspace }}/ctrlrun
+        run: python -c "import sys; sys.path.insert(0, 'tools/docs_audit'); from _core import CORE_ROOT; print(CORE_ROOT)"
 
-      - name: The CLI reference matches click's help text
-        run: python tools/docs_audit/render_cli.py --check
+      # Nine generators, each with `--check`, so no rendered table, reference page, recipe
+      # directory, readiness block, badge row or study table can be hand-edited; then the
+      # runnable snippets, the forbidden-words lint and the link check.
+      - name: The audit
+        working-directory: ctrlrun-docs
+        env:
+          CTRLRUN_SOURCE: ${{ github.workspace }}/ctrlrun
+        run: |
+          set -eu
+          python tools/docs_audit/render_capabilities.py --check
+          python tools/docs_audit/render_cli.py --check
+          python tools/docs_audit/render_schemas.py --check
+          python tools/docs_audit/render_api.py --check
+          python tools/docs_audit/render_cookbook.py --check
+          python tools/docs_audit/render_probe.py --check
+          python tools/docs_audit/render_soak.py --check
+          python tools/docs_audit/render_readiness.py --check
+          python tools/docs_audit/render_badges.py --check
+          python tools/docs_audit/snippets.py
+          python tools/docs_audit/lint.py
+          python tools/docs_audit/links.py
 
-      - name: The receipt, event and error references match the code
-        run: python tools/docs_audit/render_schemas.py --check
+      # Uploaded from here and published by the `badge` job, which runs on a push to `main`
+      # and on nothing else.
+      - name: The test-count badge
+        working-directory: ctrlrun-docs
+        env:
+          CTRLRUN_SOURCE: ${{ github.workspace }}/ctrlrun
+        run: python tools/docs_audit/render_badges.py --write-count "$GITHUB_WORKSPACE/tests-badge.json"
 
-      - name: The Python API reference matches the docstrings
-        run: python tools/docs_audit/render_api.py --check
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ctrlrun-tests-badge
+          path: tests-badge.json
 
-      - name: The cookbook directories are what their pages show
-        run: python tools/docs_audit/render_cookbook.py --check
-
-      - name: The framework-probe page is the render of the published results
-        run: python tools/docs_audit/render_probe.py --check
-
-      - name: The soak page is the render of the published results
-        run: python tools/docs_audit/render_soak.py --check
-
-      - name: The readiness block is the same in all three places
-        run: python tools/docs_audit/render_readiness.py --check
-
-      - name: The badge row matches the generator
-        run: python tools/docs_audit/render_badges.py --check
-
-      # The three audits landed `continue-on-error` in session 0, because a baseline nobody had
-      # cleared yet would have made the job red on arrival and taught everyone to ignore it.
-      # The baseline is clear -- 96 runnable blocks, 182 documents, 0 findings and 0 broken
-      # links -- so the flags come off here. An audit that cannot fail is an audit nobody runs.
-      - name: Runnable snippets execute offline
-        run: python tools/docs_audit/snippets.py
-
-      - name: Forbidden words
-        run: python tools/docs_audit/lint.py
-
-      - name: Internal links and anchors resolve
-        run: python tools/docs_audit/links.py
+  # A change here can make a page there wrong without anything there changing, so a push to
+  # `main` tells that repository to re-run its checks against this commit.
+  #
+  # **It needs `DOCS_DISPATCH_TOKEN`**, a token with `contents: write` on CTRLRun/ctrlrun-docs;
+  # `GITHUB_TOKEN` cannot reach another repository. Without the secret this step warns and does
+  # nothing, and that is a gap rather than a design -- the backstop is the weekly `schedule:`
+  # run in `ctrlrun-docs/.github/workflows/ci.yml`, which turns a dispatch that stopped
+  # arriving into a red run within a week instead of into silence.
+  notify-docs:
+    needs: [check, docs]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tell ctrlrun-docs the library changed
+        env:
+          TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${TOKEN:-}" ]; then
+            echo "::warning::DOCS_DISPATCH_TOKEN is not set; ctrlrun-docs re-checks on its weekly schedule instead"
+            exit 0
+          fi
+          curl -sS -f -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $TOKEN" \
+            https://api.github.com/repos/CTRLRun/ctrlrun-docs/dispatches \
+            -d "{\"event_type\":\"library-changed\",\"client_payload\":{\"sha\":\"$GITHUB_SHA\"}}"
 
   # The definition of done says the demo runs with no network and the README quick start
   # works verbatim. Both were only ever checked by hand, which is how a README stops being
@@ -339,10 +446,26 @@ jobs:
         with:
           python-version: "3.11"
 
+      # `SOURCE_DATE_EPOCH` is the commit's own timestamp, so a wheel built from this commit by
+      # anyone, anywhere, with the backend the lock names, is the same bytes. The sdist needs
+      # `scripts/normalize_sdist.py` for what setuptools records from the scratch directory
+      # (copy times, uid, filesystem order). The step after builds a second time and compares:
+      # "reproducible" is a claim until something checks it.
       - name: Build
         run: |
-          python -m pip install --upgrade pip build twine
-          python -m build
+          pip install --require-hashes -r requirements/build.txt
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          python -m build --no-isolation
+          python scripts/normalize_sdist.py dist/*.tar.gz
+
+      - name: The build is reproducible
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          python -m build --no-isolation --outdir /tmp/again
+          python scripts/normalize_sdist.py /tmp/again/*.tar.gz
+          (cd dist && sha256sum ./*) > /tmp/first.sha256
+          (cd /tmp/again && sha256sum ./*) | diff /tmp/first.sha256 -
+          echo "both builds produced:"; cat /tmp/first.sha256
 
       - name: Metadata renders on PyPI
         run: twine check --strict dist/*
@@ -352,9 +475,26 @@ jobs:
         # packaging it downstream. This is the guard; MANIFEST.in is the fix.
         run: |
           mkdir -p /tmp/sdist && tar xzf dist/*.tar.gz -C /tmp/sdist --strip-components=1
+          pip install --require-hashes -r requirements/ci.txt
           cd /tmp/sdist
-          pip install ".[dev,gateway,otel,identity]"
+          pip install --no-deps --no-build-isolation -e .
           pytest -q
+
+      # An SBOM of the wheel, generated the same way the release generates it, so a change that
+      # would ship a wrong one goes red on the pull request rather than at the tag. The
+      # assertions live in `tests/test_sbom.py`; this is the half that proves the script runs in
+      # a clean checkout with only its own pinned requirements installed.
+      - name: The SBOM of the wheel
+        run: |
+          pip install --require-hashes -r requirements/sbom.txt
+          ./scripts/sbom.sh dist/*.whl /tmp/ctrlrun.cdx.json
+          python -c "
+          import json, sys
+          bom = json.load(open('/tmp/ctrlrun.cdx.json'))
+          names = sorted(c['name'] for c in bom.get('components', []))
+          assert names == ['PyYAML', 'click'], names
+          print('sbom:', bom['metadata']['component']['name'], bom['specVersion'], names)
+          "
 
       - name: The quick start works from the wheel
         run: |
@@ -364,3 +504,53 @@ jobs:
           timeout 60 /tmp/qs/bin/ctrlrun demo
           /tmp/qs/bin/ctrlrun init
           test -f ctrlrun.yaml
+
+  dco:
+    # Every commit on a pull request carries a `Signed-off-by:` trailer naming its author's
+    # email: the Developer Certificate of Origin, per CONTRIBUTING.md. A shell loop rather than
+    # the DCO app, so the rule lives in the repository, pinned like everything else, with
+    # nothing to install and nothing that can be quietly uninstalled. Only git's own trailer
+    # block counts, so a sentence in the body that happens to mention the trailer does not.
+    # Nobody is exempt, bots included: an exemption keyed on a name or an email is a string
+    # anyone can set. Dependabot does sign its commits off, as `support@github.com` while
+    # authoring from its noreply address, so its trailer never matches its author. The one
+    # thing about such a commit that is not a string anyone can set is GitHub's signature on
+    # it, so a sign-off under another address is accepted on that signature and on nothing
+    # else: `verification.verified` is GitHub reporting that it signed the commit itself,
+    # which only a commit made through GitHub (an App such as Dependabot, or the web editor)
+    # carries.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Every commit is signed off by its author
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          missing=0
+          for sha in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            name="$(git log -1 --format=%an "$sha")"
+            email="$(git log -1 --format=%ae "$sha")"
+            # `only` restricts the output to the trailer block git itself recognises, and
+            # `valueonly` leaves the `Name <email>` part; the value has to end in the author's
+            # email, angle brackets included.
+            trailers="$(git log -1 --format='%(trailers:key=Signed-off-by,valueonly,only)' "$sha")"
+            if printf '%s\n' "$trailers" \
+                | awk -v want="<$email>" 'substr($0, length($0) - length(want) + 1) == want { found = 1 } END { exit !found }'; then
+              continue
+            fi
+            # A sign-off under another address, on a commit GitHub signed itself. See the job
+            # comment: the signature is the only fact here that is not a string anyone can set.
+            if [ -n "$trailers" ] && [ "$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha" --jq '.commit.verification.verified')" = "true" ]; then
+              echo "$sha: signed off as '$trailers' by $name <$email>; accepted on GitHub's signature"
+              continue
+            fi
+            echo "::error::$sha ($(git log -1 --format=%s "$sha")) has no 'Signed-off-by: $name <$email>' trailer. Add one with 'git commit --amend -s', or to every commit on the branch with 'git rebase --signoff $BASE'."
+            missing=1
+          done
+          [ "$missing" -eq 0 ]

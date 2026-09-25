@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """One contender in `reservation/e1-cross-process`. SPEC-v0.6 §2.4.
 
 Reached as `python -m ctrlrun.conformance.store.worker` with its payload on stdin -- a
@@ -89,7 +91,19 @@ def contend_on(payload: dict[str, Any]) -> dict[str, Any]:
             store.take_continuation(payload["continuation"])
         elif kind == "answer":
             if payload["answer"] == "grant":
-                store.grant_approval(payload["approval_id"], payload["who"])
+                # SPEC-v0.8 §4.3: where the job names a principal, the grant carries it, so a
+                # store's count is contended by **distinct verified approvers** rather than by
+                # anonymous writers it can deduplicate on nothing.
+                agent = payload.get("agent")
+                if agent:
+                    from ...action import Principal
+                    from ...approval import _granting_principal
+
+                    who = Principal(agent=agent, user=payload.get("user"))
+                    with _granting_principal(who):
+                        store.grant_approval(payload["approval_id"], payload["who"])
+                else:
+                    store.grant_approval(payload["approval_id"], payload["who"])
             else:
                 store.deny_approval(payload["approval_id"], payload["who"])
         else:  # pragma: no cover - a payload the kit did not write

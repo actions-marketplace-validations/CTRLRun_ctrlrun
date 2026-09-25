@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """The MCP gateway. Build-list item 6; SPEC-v0.2 §6. Ships in `ctrlrun[gateway]`.
 
 Nothing here is imported by `import ctrlrun` (SPEC-v0.2 §1.1): the package is reachable only
@@ -13,18 +15,20 @@ non-execution, and it is only provable if no request byte can have been written.
 from __future__ import annotations
 
 import importlib
+import logging
 import sys
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Final
 
-from ..errors import MissingDependency
+from ..errors import InvalidArgument, MissingDependency
 
 #: The extra's HTTP client, imported by name so a missing one is a `MissingDependency`
 #: rather than a `ModuleNotFoundError` from halfway down an import chain.
 _HTTP_CLIENT: Final = "httpx"
 
 #: The extra that carries it, for the install command in the error.
+_LOG: Final = logging.getLogger("ctrlrun.gateway")
 _EXTRA: Final = "gateway"
 
 __all__ = ["serve", "serve_operator"]
@@ -102,8 +106,20 @@ def serve(*, upstream: str, alias: str, **options: Any) -> None:
         sinks=sinks,
         authority=authority,
         environment=control.environment,
+        # SPEC-v0.10 §4.3 — the gateway is the surface that holds the connection, so it is the
+        # one that can name the upstream an action is pinned against. In-process this is `None`
+        # and §4.4 refuses a pinned action there.
+        upstream=config.upstream,
     )
-    forwarder = httpx_forwarder(config)
+    # SPEC-v0.10 §4.3's check 1, and the only one of the three where the operator is present.
+    # Without it the observation register is empty in every shipped process, check 2 answers
+    # `upstream_unverified` for ever, and a gateway that pins refuses every pinned action. A
+    # review found exactly that: the register was written only by tests.
+    #
+    # **A mismatch refuses to start**, printing observed beside pinned, because a pin an operator
+    # got wrong should fail on a console rather than on production traffic.
+    _observe_the_upstream(control, config)
+    forwarder = httpx_forwarder(config, control.policy)
     gateway = Gateway(config, control, forwarder)
     _announce(control, config, gateway.identity, authority_path)
     try:
@@ -127,7 +143,6 @@ def _authority(control: Any, path: str | None) -> Any:
     operator who edited the wrong file saw no effect and no error.
     """
     from ..authority import Authority
-    from ..errors import InvalidArgument
 
     if path is None:
         return control.authority
@@ -268,36 +283,94 @@ def _announce_operator(control: Any, config: Any, identity: Any, store: Any) -> 
     `print` rather than the logger, because this is the CLI's own output and a logger with no
     configured handler would swallow it — which is the failure mode the block exists to
     prevent, in miniature.
+
+    **Over stdio the whole block goes to stderr** (§2.3). Stdout is the protocol stream there,
+    the client parses every line of it as JSON-RPC, and a startup block on it is read as a
+    broken message rather than as information: the first stdio client this was tried behind
+    logged "ignoring non-JSON output" for every line of it.
     """
-    print(
-        f"ctrlrun mcp-operator — listening on {config.host}:{config.port}{config.path}",
-        flush=True,
-    )
-    print(f"environment  {control.environment}", flush=True)
+    out = sys.stderr if config.stdio else sys.stdout
+
+    def line(text: str) -> None:
+        print(text, file=out, flush=True)
+
+    if config.stdio:
+        line("ctrlrun mcp-operator — stdio; no socket, one client, the one that launched this")
+    else:
+        line(f"ctrlrun mcp-operator — listening on {config.host}:{config.port}{config.path}")
+    line(f"environment  {control.environment}")
     # SPEC-mcp-operator §6 — for a server whose whole premise is "both processes on one host
     # against one store", and which has a `--store-url` that silently changes it, this is the
     # line an operator most needs. A review found the block printing everything but this.
-    print(f"store        {getattr(store, 'path', store)}", flush=True)
-    print(f"identity     {type(identity).__name__}", flush=True)
+    line(f"store        {getattr(store, 'path', store)}")
+    line(f"identity     {type(identity).__name__}")
     if config.principal_header is not None:
-        print(
+        line(
             f"             trusts the header {config.principal_header!r}: it is worth what "
             "the proxy that sets it is worth,"
         )
-        print(
+        line(
             "             and that proxy must authenticate the caller and overwrite the "
             "header on every request (SPEC-v0.3 §3.3)"
         )
-    print(
+    if config.stdio:
+        line(
+            f"             the account this process runs as, {identity.login!r}, read from the "
+            "real uid and from nothing the client"
+        )
+        line(
+            "             sends or sets. It carries no roles and no expiry, so this process "
+            "holds approve, deny and resolve under"
+        )
+        line(
+            "             that name for as long as it runs; the confirmation the client shows "
+            "before a write is the only human step"
+        )
+        if identity.is_root:
+            line(
+                "             RUNNING AS ROOT: an account, not a person. Every write is "
+                "refused (-41013); reads still answer"
+            )
+    line(
         "read tools   answer without a credential; loopback is not a boundary against "
         "other processes on this host"
     )
-    print(
-        "write tools  approve, deny, resolve — each needs a credential naming a human, "
-        "and each answer is recorded under that name"
-    )
-    if control.authority is not None:
-        print(
-            f"authority    {len(control.authority.grants)} grant(s), evaluated by the agent",
-            flush=True,
+    if config.stdio:
+        line(
+            "write tools  approve, deny, resolve — each answer is recorded under "
+            f"{identity.login!r}"
         )
+    else:
+        line(
+            "write tools  approve, deny, resolve — each needs a credential naming a human, "
+            "and each answer is recorded under that name"
+        )
+    if control.authority is not None:
+        line(f"authority    {len(control.authority.grants)} grant(s), evaluated by the agent")
+
+
+def _observe_the_upstream(control: Any, config: Any) -> None:
+    """SPEC-v0.10 §4.3, check 1. One connection, one comparison, before the listener opens."""
+    from ..upstream import observe_upstream, pinned_context
+
+    pins = [control.policy.upstream_pin(name) for name in control.policy.actions]
+    pinned = [pin for pin in pins if pin]
+    if not pinned:
+        return
+    certs = tuple(sorted({path for pin in pinned for path in pin.certs}))
+    observed = observe_upstream(
+        config.upstream,
+        verify=pinned_context(certs) if certs else None,
+        timeout=config.upstream_timeout,
+    )
+    expected: set[str] = set()
+    for pin in pinned:
+        expected.update(pin.cert_sha256)
+    if expected and observed not in expected:
+        raise InvalidArgument(
+            f"{config.upstream} presented {observed}, which is in no 'tls_cert_sha256' this "
+            f"policy pins ({', '.join(sorted(expected))}). A swapped server behind the same "
+            "name is what the pin exists to catch, so the gateway does not start "
+            "(SPEC-v0.10 §4.3)"
+        )
+    _LOG.info("upstream %s observed as %s", config.upstream, observed)

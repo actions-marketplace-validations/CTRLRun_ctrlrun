@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """Control, @protect and context(). SPEC-v0.1 §2.2, §6, §8; acceptance test T6."""
 
 import json
@@ -685,6 +687,23 @@ def test_receipt_json_has_exactly_the_specified_fields(control, store):
         "policy_hash",
         "policy_version",
         "controls",
+        # SPEC-v0.7 §6.11: `ctrlrun.receipt/v4`. What the presenting pass compared, hashes
+        # only, and `null` here because nothing asked for a precondition.
+        "precondition_at_request",
+        "precondition_at_recheck",
+        # SPEC-v0.8 §11.3: `ctrlrun.receipt/v5` adds the two, and the whole shape is
+        # frozen before item 2 writes it, so `authority_grant_id` is present and null
+        # until item 5 fills it.
+        "approvers",
+        "authority_grant_id",
+        # SPEC-v0.9 §6, a `ctrlrun.receipt/v6` field.
+        "task",
+        # SPEC-v0.9 §5.5, a `ctrlrun.receipt/v6` field.
+        "scope_hash",
+        # SPEC-v0.9 §10.1, the third `ctrlrun.receipt/v6` field.
+        "budget_charges",
+        # SPEC-v0.10 §3.5, the one `ctrlrun.receipt/v7` field.
+        "hop",
     }
     assert document["schema"] == RECEIPT_SCHEMA
     assert document["receipt_id"].startswith("ctr_")

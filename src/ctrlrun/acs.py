@@ -1,12 +1,14 @@
-"""An ACS control hook backed by CTRLRun. Ships in `ctrlrun[gateway]`.
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
+"""An ACS control hook backed by ctrlrun. Ships in `ctrlrun[gateway]`.
 
 Read against the Agent Control Standard v0.1.0 schemas in
 `GenAI-Security-Project/agent-control-standard` at commit `c7ad162` (2026-08-11):
 `specification/v0.1.0/request-envelope.json`, `response-envelope.json`,
 `hooks/tool-call-request.json`, `hooks/tool-call-result.json` and `ask-details.json`.
-`docs/docs/ACS.md` records what was read and where the two models disagree.
+`https://ctrlrun.dev/docs/ACS` records what was read and where the two models disagree.
 
-**ACS is advisory; CTRLRun is executing.** A Guardian returns a decision and the *platform*
+**ACS is advisory; ctrlrun is executing.** A Guardian returns a decision and the *platform*
 runs the tool, which is the opposite way round from `@protect`. So one action is split across
 two hooks:
 
@@ -27,7 +29,7 @@ from collections.abc import Mapping
 from typing import Any, Final
 
 from .action import Action, Principal
-from .control import Control, with_approval
+from .control import Control, _UnmeasurableError, with_approval
 from .effect import resolve_effect_key, resolve_resource
 from .errors import (
     ActionDenied,
@@ -49,7 +51,7 @@ _LOG = logging.getLogger(__name__)
 #: The ACS revision these mappings were read against.
 ACS_VERSION: Final = "0.1.0"
 
-#: The two `steps/*` hooks CTRLRun answers. Every other method is somebody else's checkpoint.
+#: The two `steps/*` hooks ctrlrun answers. Every other method is somebody else's checkpoint.
 TOOL_CALL_REQUEST: Final = "steps/toolCallRequest"
 TOOL_CALL_RESULT: Final = "steps/toolCallResult"
 
@@ -59,7 +61,7 @@ DENY: Final = "deny"
 ASK: Final = "ask"
 
 #: `tool-call-result.json` — the four statuses ACS defines, and nothing about what any of
-#: them means for the side effect. See `docs/docs/ACS.md`.
+#: them means for the side effect. See `https://ctrlrun.dev/docs/ACS`.
 SUCCESS: Final = "success"
 FAILURE: Final = "failure"
 TIMEOUT: Final = "timeout"
@@ -82,7 +84,7 @@ DEFAULT_ASK_TIMEOUT_SECONDS: Final = 900
 
 
 class AcsControlHook:
-    """Answer ACS `steps/*` hooks with CTRLRun's decisions and outcomes.
+    """Answer ACS `steps/*` hooks with ctrlrun's decisions and outcomes.
 
     One `Control`, one prefix. `prefix` names the tool namespace in the action name, the way
     the gateway's `--alias` does: `<prefix>.<provider>.<tool>` — so a policy addresses one
@@ -98,6 +100,23 @@ class AcsControlHook:
         ask_timeout_seconds: int = DEFAULT_ASK_TIMEOUT_SECONDS,
         identity: IdentityProvider | None = None,
     ) -> None:
+        pinned = [name for name in control.policy.actions if control.policy.upstream_pin(name)]
+        if pinned:
+            # SPEC-v0.10 §4.4 — **at construction, and not at load.** ACS is advisory: the
+            # *platform* runs the tool and this hook never holds a connection to anything, so
+            # there is no observation point and nothing to pin. A load error cannot serve here,
+            # because one loader cannot know which surface will run an action and `verify` and
+            # `scan` must still read a document that pins (§7.3). `v0.3 §8.4` refuses a hook
+            # built with no identity provider the same way, for the same reason: a deployment
+            # finds out at startup rather than during an incident.
+            raise InvalidArgument(
+                f"this policy pins an upstream for {pinned[0]!r}"
+                + (f" and {len(pinned) - 1} other action(s)" if len(pinned) > 1 else "")
+                + ", and the ACS hook holds no connection to an upstream: ACS is advisory and "
+                "the platform executes, so there is nothing here to observe or pin. Take the "
+                "'upstream:' key off those entries, or front the server with 'ctrlrun gateway' "
+                "instead (SPEC-v0.10 §4.4)"
+            )
         if control.authority is not None and identity is None:
             # SPEC-v0.3 §8.4 — without a provider this hook reads `params.metadata.agent_id`
             # straight off the inbound envelope, and §4 makes the principal an authorization
@@ -149,6 +168,19 @@ class AcsControlHook:
                 return self._on_request(rpc_id, request_id, params, headers or {})
             if method == TOOL_CALL_RESULT:
                 return self._on_result(rpc_id, request_id, params)
+        except _UnmeasurableError as refused:
+            # SPEC-v0.9 §2.3, §2.4.1. **Before the clause below, and answered as a decision**,
+            # because for this refusal there *is* an action: `Control` has already written
+            # `ACTION_DENIED` and a `denied` receipt for it. An independent review found the two
+            # disagreeing -- an error envelope says the Guardian could not answer, which a
+            # platform is free to act on however it likes, while the evidence said the kernel
+            # refused. That is precisely what the `IdentityError` clause below forbids.
+            #
+            # The code follows the refusal rather than being fixed here, for the same reason
+            # that clause gives: `budget_unmeasurable` and `budget_unkeyed` are different things
+            # to fix, and the receipt already names which.
+            _LOG.warning("refused an ACS envelope: %s", refused)
+            return _final(rpc_id, request_id, DENY, reasoning=str(refused), codes=[refused.reason])
         except InvalidArgument as refused:
             # A malformed payload is not a decision about an action: there is no action.
             return _error(rpc_id, MALFORMED_ENVELOPE, str(refused))
@@ -156,7 +188,7 @@ class AcsControlHook:
             # SPEC-v0.3 §8.4 — a credential offered and rejected, or a provider that named
             # nobody. Answered as `deny` rather than as a protocol `error`: an error envelope
             # says "the Guardian could not answer", and a platform is free to decide what to
-            # do with that. A denial says what CTRLRun means, which is that the tool must not
+            # do with that. A denial says what ctrlrun means, which is that the tool must not
             # run.
             #
             # The reason code is **not** always `no_principal`. This clause spans the whole of
@@ -174,7 +206,7 @@ class AcsControlHook:
         return _error(
             rpc_id,
             METHOD_NOT_ANSWERED,
-            f"{method} is not a checkpoint CTRLRun answers; it decides tool calls only",
+            f"{method} is not a checkpoint ctrlrun answers; it decides tool calls only",
         )
 
     # --- steps/toolCallRequest ----------------------------------------------------------
@@ -190,6 +222,16 @@ class AcsControlHook:
         payload = _mapping(params.get("payload"), "params.payload")
         action = self._action(params, payload, headers)
         effect_key = self._effect_key(action)
+        # SPEC-v0.10 §3.1.2 — the hop and the task the caller referenced, from the metadata bag
+        # this hook already reads. **Lookup keys, not assertions**: the principal is still the
+        # `IdentityProvider`'s and `params.metadata.agent_id` is still ignored (§8.4), and a hop
+        # addressed to somebody else matches nothing. Non-strings are dropped rather than
+        # coerced, so a malformed bag references no hop rather than failing the call.
+        metadata = _mapping(params.get("metadata"), "params.metadata")
+        hop = metadata.get("hop")
+        task = metadata.get("task")
+        hop = hop if isinstance(hop, str) else None
+        task = task if isinstance(task, str) else None
 
         # SPEC-v0.2 §6.10's rule, in ACS's shape: a client comes back by re-sending the
         # identical call, and the newest granted, unexpired approval for this action's hash
@@ -201,12 +243,12 @@ class AcsControlHook:
         # in the spec so this item could not miss it.
         granted = (
             self._control.store.find_granted_approval(action.action_hash)
-            if self._control.evaluate(action).decision.value == "approve"
+            if self._control.evaluate(action, task=task, hop=hop).decision.value == "approve"
             else None
         )
 
         def suspend_holding_the_reservation() -> Any:
-            # The platform executes, not CTRLRun. `Suspended` is how an executor says the
+            # The platform executes, not ctrlrun. `Suspended` is how an executor says the
             # outcome is not known yet *and no outcome should be recorded* (§6.9): the
             # record stays EXECUTING, the lease is extended, and this request_id is what the
             # result hook presents to close it.
@@ -215,9 +257,13 @@ class AcsControlHook:
         try:
             if granted is not None:
                 with with_approval(granted.approval_id):
-                    self._control.execute(action, suspend_holding_the_reservation, effect_key)
+                    self._control.execute(
+                        action, suspend_holding_the_reservation, effect_key, task=task, hop=hop
+                    )
             else:
-                self._control.execute(action, suspend_holding_the_reservation, effect_key)
+                self._control.execute(
+                    action, suspend_holding_the_reservation, effect_key, task=task, hop=hop
+                )
         except Suspended:
             return _final(rpc_id, request_id, ALLOW)
         except IdentityError as refused:
@@ -272,7 +318,7 @@ class AcsControlHook:
     def _ask(
         self, rpc_id: Any, request_id: str, action: Action, pending: ApprovalRequired
     ) -> dict[str, Any]:
-        """CTRLRun's APPROVE in ACS's shape (`ask-details.json`).
+        """ctrlrun's APPROVE in ACS's shape (`ask-details.json`).
 
         `approver`, `question` and `timeout_seconds` are all required by the schema, so all
         three are present or the response is not conformant. The question carries the
@@ -301,7 +347,7 @@ class AcsControlHook:
     def _on_result(self, rpc_id: Any, request_id: str, params: Mapping[str, Any]) -> dict[str, Any]:
         """Close the reservation the request hook took, with what actually happened.
 
-        ACS describes this hook as an output redaction checkpoint. CTRLRun redacts nothing —
+        ACS describes this hook as an output redaction checkpoint. ctrlrun redacts nothing —
         it records — so the decision is always `allow`; the work is the outcome it writes.
         """
         payload = _mapping(params.get("payload"), "params.payload")
@@ -341,7 +387,7 @@ class AcsControlHook:
             # No held suspension matches. A restarted Guardian, a result fired twice, or one
             # arriving out of order. There is nothing to close, and inventing an outcome for
             # an effect nobody reserved would be worse than recording none.
-            _LOG.warning("no held CTRLRun reservation matches ACS request_id_ref %s", held)
+            _LOG.warning("no held ctrlrun reservation matches ACS request_id_ref %s", held)
         except CTRLRunError as refused:
             _LOG.warning("could not close the reservation for %s: %s", held, refused)
         return _final(rpc_id, request_id, ALLOW)

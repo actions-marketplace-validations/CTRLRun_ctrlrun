@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """Request parsing and header-body validation. Build-list item 6b; SPEC-v0.2 §6.2, §6.4, §6.6.
 
 **The headers are checked; the body is believed.** The revision mirrors `method`,
@@ -75,6 +77,15 @@ class ParsedRequest:
     is_response: bool = False
     tool_name: str | None = None
     arguments: Mapping[str, Any] = field(default_factory=dict)
+    #: SPEC-v0.10 §3.1.2 — the hop and the task the caller referenced, read out of
+    #: `params.metadata`, which is the field MCP already carries for caller-supplied metadata.
+    #:
+    #: **These are lookup keys, not assertions**, and that is the whole of why reading them off
+    #: the payload is safe where `v0.3 §8.4` refuses to read a principal off it. The principal is
+    #: still the `IdentityProvider`'s; a hop addressed to somebody else matches nothing (§3.1.1),
+    #: and a hop id naming nothing is `authority_hop`. Neither value widens anything on its own.
+    hop: str | None = None
+    task: str | None = None
 
     @property
     def is_legacy(self) -> bool:
@@ -137,6 +148,15 @@ def parse_request(
     arguments = params.get("arguments")
     arguments = dict(arguments) if isinstance(arguments, Mapping) else {}
 
+    # SPEC-v0.10 §3.1.2. Non-string values are dropped rather than coerced or refused: a caller
+    # that sends `{"hop": 7}` has referenced no hop, and the action is then decided exactly as one
+    # presenting none. Refusing here would make a malformed metadata bag a transport error for an
+    # action that may not need a hop at all.
+    metadata = params.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    hop = metadata.get("hop")
+    task = metadata.get("task")
+
     mismatch = _validate_headers(headers, revision, method, tool_name, arguments)
     if mismatch is not None:
         return mismatch
@@ -148,6 +168,8 @@ def parse_request(
         intercept=intercept,
         tool_name=tool_name if isinstance(tool_name, str) else None,
         arguments=arguments,
+        hop=hop if isinstance(hop, str) else None,
+        task=task if isinstance(task, str) else None,
     )
 
 
@@ -263,10 +285,18 @@ def _decoded(value: str) -> str | None:
 
 
 def encode_header_value(value: str) -> str:
-    """Wrap a value in the revision's base64 sentinel where it is not ASCII-safe (§6.4)."""
+    """Wrap a value in the revision's base64 sentinel where it is not ASCII-safe (§6.4).
+
+    A value that is ASCII but *looks like* the sentinel is wrapped too, or `_decoded` on the far
+    side would try to decode the bare value and refuse a header that faithfully mirrored the
+    body. A review found the gap when the operator's stdio loop started mirroring tool names.
+    """
     try:
         value.encode("ascii")
+        wrap = value.startswith(_SENTINEL_OPEN) and value.endswith(_SENTINEL_CLOSE)
     except UnicodeEncodeError:
+        wrap = True
+    if wrap:
         encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
         return f"{_SENTINEL_OPEN}{encoded}{_SENTINEL_CLOSE}"
     return value
@@ -295,7 +325,7 @@ def _agrees(declared: str, value: object) -> bool:
     Anything that is not a string, an integer or a boolean has **no** header encoding at all:
     the revision permits `x-mcp-header` only on those three, and says a `null` parameter omits
     its header entirely. So a header naming an argument of any other type cannot agree with it,
-    and the answer is `False` rather than a comparison against a rendering CTRLRun made up.
+    and the answer is `False` rather than a comparison against a rendering ctrlrun made up.
     """
     if isinstance(value, str):
         return declared == value

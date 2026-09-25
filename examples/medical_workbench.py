@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """Synthetic evidence workbench: real policy, approval, effects, and receipts.
 
 The curated fixture validator is deliberately narrow. It is not a scientific
@@ -136,6 +138,15 @@ def step(request_json: str) -> str:
                         approved = store.grant_approval(
                             pending.request_id, "human:demo-medical-reviewer"
                         )
+                        if approved is None:
+                            # SPEC-v0.8 §4.4. This policy asks for one approval, so this
+                            # branch is unreachable here; it raises rather than passing,
+                            # because an example that silently carried `None` forward would
+                            # fail later somewhere that says nothing about why.
+                            raise SystemExit(
+                                "the demo policy asks for one approval and this grant "
+                                "recorded without reaching it"
+                            ) from None
                         approval = approved.approval_id
                         approval_version = snapshot["version"]
                         result.update(outcome="approved", action_hash=approved.action_hash)

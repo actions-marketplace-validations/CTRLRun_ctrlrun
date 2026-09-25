@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """The adapter surface. Build-list item 2; SPEC-v0.5 §2, §3.
 
 An adapter exists for exactly one reason: **to route an `APPROVE` through a framework's own
@@ -197,7 +199,7 @@ class FrameworkInterrupt(Protocol):
     #: A **declaration about the framework**, not a setting. `True` makes the binding check
     #: mandatory, and an answer that omits `approved_arguments` is refused. `False` says the
     #: resumption carries nothing the adapter can inspect, so the binding across the interrupt
-    #: is the framework's checkpoint rather than CTRLRun's -- attribution, not prevention -- and
+    #: is the framework's checkpoint rather than ctrlrun's -- attribution, not prevention -- and
     #: it is not free: the conformance kit reports `binding: not_applicable` with the adapter's
     #: reason, permanently, where a reviewer reads first. A flag hides a weakening; this
     #: publishes one.
@@ -301,7 +303,27 @@ class InterruptApprovalProvider:
             )
 
         if answer.granted:
-            return self._store.grant_approval(request_id, answer.approver)
+            granted = self._store.grant_approval(request_id, answer.approver)
+            # SPEC-v0.8 §4.4, and the same trap as the scripted provider: `None` from the store
+            # means recorded and short of N, while `None` from `wait` means `v0.1 §4.3`'s
+            # "answered, no". Returning it straight through would report a partial grant as a
+            # **denial**, and `@protect(wait=True)` would raise `ActionDenied` for a request a
+            # second human is still answering.
+            #
+            # This `wait` is not a polling loop: it puts the question to the framework once. So
+            # the truthful answer is that nobody completed it here, which is `ApprovalTimeout`,
+            # naming what is still outstanding. The answer **is** recorded, and another surface
+            # can complete it.
+            if granted is not None:
+                return granted
+            outstanding = self._store.get_approval(request_id)
+            recorded = 0 if outstanding is None else len(outstanding.approvers)
+            needed = 1 if outstanding is None else outstanding.request.approvals_required
+            raise ApprovalTimeout(
+                f"approval request {request_id} holds {recorded} of {needed} approvals; this "
+                "answer was recorded and the request needs another principal",
+                request_id=request_id,
+            )
         self._store.deny_approval(request_id, answer.approver)
         return None
 
@@ -411,6 +433,8 @@ def needs_approval(
     arguments: Mapping[str, Any],
     *,
     resource: str | None = None,
+    task: str | None = None,
+    hop: str | None = None,
 ) -> bool:
     """Does this call need a human? For a framework that asks before it invokes (SPEC-v0.5 §3.5).
 
@@ -437,6 +461,13 @@ def needs_approval(
     `resource:` is used where none is given -- the same precedence `@protect` applies. It
     matters: authority matches on resource patterns (SPEC-v0.3 §4.2), so a predicate that
     skipped it would evaluate a different action from the one that runs.
+
+    `task` and `hop` are that same argument one frame further out (SPEC-v0.10 §9). Without them
+    this predicate evaluates against the receiver's **whole candidate set** while `execute`
+    evaluates against the hop **alone** (§2.3), so it answers "no human needed" for a call
+    `execute` then refuses. That is not a wider grant -- `Control.execute` is the enforcement
+    point and decides against the hop either way -- but it costs the framework its own approval
+    item, and a human is not asked before an invocation that then fails.
     """
     principal = control.resolve_principal(action)
     template = resource if resource is not None else control.policy.resource_template(action)
@@ -447,7 +478,7 @@ def needs_approval(
         resource=None if template is None else resolve_resource(template, arguments),
         environment=control.environment,
     )
-    return control.evaluate(proposed).decision is Decision.APPROVE
+    return control.evaluate(proposed, task=task, hop=hop).decision is Decision.APPROVE
 
 
 def banner(control: Control) -> None:

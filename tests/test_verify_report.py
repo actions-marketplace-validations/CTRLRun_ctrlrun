@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """Reporting: the human report, `--json`, `--junit`, the exit codes. SPEC-v0.4 §4; T113-T117.
 
 The report is where the three rules become visible or stop being true. A count that summed the
@@ -8,6 +10,7 @@ the same false green in a different costume, and each has a test here.
 from __future__ import annotations
 
 import json
+import re
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
@@ -106,9 +109,19 @@ def test_T113_the_summary_is_the_last_line_and_names_the_not_applicable_ids(tmp_
 
     assert last == report.summary_line()
     assert last.startswith(f"{report.passed}/{report.applicable} declared guarantees pass.")
-    assert "5 not applicable: G3, G4, G5, G8, G9." in last
-    # The fraction is passes over applicable. A report with five N/As does not say 10/10.
-    assert "10/10" not in text
+    # G13 is N/A on every SQLite run: SQLite has no clock of its own. G14 needs the effect
+    # template this document keeps in the @protect decorator, and G15 a `max_attempts` it does
+    # not declare (SPEC-v0.7 §8.9). G25 needs a delegable grant, which this document has none of.
+    #
+    # **Derived, not spelled out.** This assertion used to carry the id list as a literal, and
+    # every milestone that adds a guarantee edits it: G19 broke nine such assertions across three
+    # files, and G25 broke this one. What the test is *for* is the shape, that the N/A count is
+    # its own sentence naming its ids, so that is what it asserts.
+    na = [result.id for result in report.guarantees if result.status is Status.NOT_APPLICABLE]
+    assert na, "this fixture is meant to leave some guarantees not applicable"
+    assert f"{len(na)} not applicable: {', '.join(na)}." in last
+    # The fraction is passes over applicable. A report with N/As does not fold them into it.
+    assert f"{report.applicable + len(na)}/{report.applicable + len(na)}" not in text
 
 
 def test_T113_a_failing_report_names_the_subject_and_prints_the_counterexample(
@@ -131,16 +144,28 @@ def test_T113_a_failing_report_names_the_subject_and_prints_the_counterexample(
 @pytest.mark.parametrize(
     ("document", "expected"),
     [
-        (ALL_APPLICABLE, "9/9 declared guarantees pass. 2 not applicable"),
-        (WITH_NOT_APPLICABLE, "6/6 declared guarantees pass. 5 not applicable"),
-        (EMPTY, "0/0 declared guarantees pass. 11 not applicable"),
+        # SPEC-v0.8 item 2: G18 joins the catalogue. It is graded wherever the document sends
+        # an action to approval, which the first two of these do, and `N/A` for G1's reason
+        # where nothing does. So the first two gain a pass and the third gains an N/A.
+        # The passes are literal because they are the point; the N/A count is derived, for the
+        # reason above. `len(reg.GUARANTEES)` moves with the catalogue and these fixtures do not.
+        (ALL_APPLICABLE, "21/21 declared guarantees pass."),
+        (WITH_NOT_APPLICABLE, "16/16 declared guarantees pass."),
+        (EMPTY, "0/0 declared guarantees pass."),
     ],
     ids=["passing", "some-na", "all-na"],
 )
 def test_T113_the_summary_over_three_shapes_of_configuration(tmp_path, document, expected):
     report = run(_write(tmp_path, document))
 
-    assert report.to_text().split("\n")[-1].startswith(expected)
+    last = report.to_text().split("\n")[-1]
+    assert last.startswith(expected)
+    # Every guarantee in the catalogue is accounted for exactly once, whatever the catalogue
+    # holds: passed, failed or not applicable. That is the invariant the literal counts were
+    # standing in for, and it does not need editing when a milestone adds an id.
+    na = [result.id for result in report.guarantees if result.status is Status.NOT_APPLICABLE]
+    assert f"{len(na)} not applicable" in last
+    assert report.applicable + len(na) == len(reg.GUARANTEES)
 
 
 # --- T114: `--json` validates, and the counterexample is conditional -----------------------
@@ -183,7 +208,7 @@ def test_T114_the_document_matches_the_schema_field_for_field(tmp_path):
 
     assert set(document) == TOP_LEVEL
     assert document["schema"] == REPORT_SCHEMA == "ctrlrun.verify/v1"
-    assert document["catalogue"] == reg.CATALOGUE == "ctrlrun.guarantees/v2"
+    assert document["catalogue"] == reg.CATALOGUE == "ctrlrun.guarantees/v7"
     assert set(document["policy"]) == {"path", "sha256", "schema", "mode", "actions"}
     assert document["authority"] is None
     assert document["store"] == {"backend": "sqlite", "scratch": True}
@@ -377,7 +402,7 @@ def test_T116_exit_1_when_a_guarantee_fails(tmp_path, monkeypatch):
         (MALFORMED, (), "unknown policy schema"),
         (EMPTY, (), "nothing was checked"),
         (ALL_APPLICABLE, ("--only", "G99"), "G99"),
-        # A backend CTRLRun really does not have. `postgres://` is accepted from v0.6 (§9.6
+        # A backend ctrlrun really does not have. `postgres://` is accepted from v0.6 (§9.6
         # amendment 2), so using it here tested the driver's absence rather than the flag's
         # refusal -- which passed wherever psycopg happened to be installed.
         (ALL_APPLICABLE, ("--store-url", "mysql://x/y"), "postgresql://"),
@@ -437,14 +462,22 @@ def test_T116_exit_3_for_an_internal_error(tmp_path, monkeypatch):
     assert "internal error" in result.stderr
 
 
-def test_T116_a_run_with_five_not_applicable_still_exits_0(tmp_path, monkeypatch):
-    """N/A never changes the exit code by itself."""
+def test_T116_a_run_with_several_not_applicable_still_exits_0(tmp_path, monkeypatch):
+    """N/A never changes the exit code by itself.
+
+    The count moves whenever the catalogue grows a guarantee this document cannot exercise, so
+    it is read off the report rather than pinned: what T116 is about is the exit code.
+    """
     monkeypatch.chdir(tmp_path)
 
     result = _cli(tmp_path, WITH_NOT_APPLICABLE)
 
     assert result.exit_code == 0
-    assert "5 not applicable" in result.stdout
+    # The docstring above already said this is read off the report rather than pinned; the
+    # assertion said otherwise, and G25 is what made the two disagree out loud.
+    reported = re.search(r"(\d+) not applicable", result.stdout)
+    assert reported is not None, result.stdout
+    assert int(reported.group(1)) > 0
 
 
 def test_T116_json_and_junit_can_be_combined(tmp_path, monkeypatch):

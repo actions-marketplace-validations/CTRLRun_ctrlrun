@@ -1,8 +1,10 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """click command group for the ctrlrun CLI. Build-list item 8; SPEC-v0.1 §8.
 
 The CLI is the human end of the kernel: it answers approval requests, shows the evidence,
 and resolves the one state no machine may resolve for itself (§5.2). It is also the only
-place in CTRLRun that prints.
+place in ctrlrun that prints.
 
 Every command works on the store an agent is already using — `.ctrlrun/state.db` beside the
 policy, or wherever `$CTRLRUN_STATE` says (§8) — so approving here answers the request an
@@ -11,32 +13,61 @@ agent is waiting on in another shell.
 
 from __future__ import annotations
 
+import importlib
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from contextlib import suppress
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import click
 
-from ..action import Principal
+from ..action import Action, Principal
+from ..anchor import (
+    ANCHOR_KINDS,
+    INTERVAL,
+    AnchorProvider,
+    make_anchor,
+    verify_anchors,
+)
 from ..approval import ApprovalRecord, LocalApprovalProvider
-from ..authority import Delegation, grant_from_yaml
+from ..authority import Budget, Delegation, grant_from_json, grant_from_yaml
 from ..control import DEFAULT_STATE_DIR, Control, state_path
 from ..effect import RESOLVED_BY_HUMAN, EffectRecord, EffectState
-from ..errors import AuthorityEscalation, CTRLRunError, InvalidArgument, PolicyError
-from ..policy import DEFAULT_POLICY_FILENAME, OBSERVE, Policy
+from ..errors import (
+    ApprovalRequired,
+    AuthorityEscalation,
+    CTRLRunError,
+    InvalidArgument,
+    PolicyError,
+)
+from ..policy import DEFAULT_POLICY_FILENAME, OBSERVE, Decision, Policy
 from ..receipt import (
     Event,
     EventType,
     JSONLEventSink,
     Receipt,
+    ReceiptResult,
+    UnreadableReceipt,
+    _readable,
     iso_timestamp,
+    new_receipt_id,
     verify_chain,
 )
-from ..reporting import inspection_for, since_boundary, stats_document
-from ..state import RESOLUTIONS, SQLiteStateStore, StateStore
+from ..reporting import (
+    budget_document,
+    budget_lines,
+    hop_document,
+    hop_lines,
+    inspection_for,
+    ledger_rows,
+    since_boundary,
+    stats_document,
+)
+from ..retention import PRUNE_ACTION, Hold, prune
+from ..state import RESOLUTIONS, DelegationRecord, SQLiteStateStore, StateStore
 from .demo import run_demo
 
 #: Who the CLI records as the answer's author. Free text in v0.1 (SPEC-v0.1 §4.1).
@@ -109,7 +140,7 @@ STORE_URL_OPTION = click.option(
     ),
 )
 
-#: CTRLRun's own parameter on a Postgres URL, peeled off before the URL reaches the driver. The
+#: ctrlrun's own parameter on a Postgres URL, peeled off before the URL reaches the driver. The
 #: same spelling `ctrlrun.conformance.store` uses, because an operator who has seen one should not
 #: have to learn the other.
 SCHEMA_PARAM: Final = "ctrlrun_schema"
@@ -193,7 +224,7 @@ def _opened(path: Path) -> StateStore:
 
 
 def _require_head(url: str, schema: str) -> None:
-    """Refuse unless `schema` already holds a CTRLRun database at HEAD. Reads only.
+    """Refuse unless `schema` already holds a ctrlrun database at HEAD. Reads only.
 
     Three refusals, each naming what the operator should do instead, because "that schema is
     empty" and "your fleet is mid-upgrade" have nothing in common as remedies.
@@ -218,7 +249,7 @@ def _require_head(url: str, schema: str) -> None:
             )
             if cursor.fetchone() is None:
                 raise click.ClickException(
-                    f"schema {schema!r} holds no CTRLRun database. A read command does not "
+                    f"schema {schema!r} holds no ctrlrun database. A read command does not "
                     "create one; the store is created by the process that runs your agents."
                 )
             cursor.execute(
@@ -235,19 +266,19 @@ def _require_head(url: str, schema: str) -> None:
     if found in (Classification.FORWARD, Classification.EMPTY, Classification.BASELINE):
         missing = [item.id for item in MIGRATIONS if item.id not in applied]
         raise click.ClickException(
-            f"the database in schema {schema!r} is behind this CTRLRun: "
+            f"the database in schema {schema!r} is behind this ctrlrun: "
             f"{', '.join(missing)} has not been applied. A read command will not apply it -- "
             "every other process on that database is still running the version that has not "
             "got it. Upgrade a writer and let it migrate at open (SPEC-v0.6 §3.6)."
         )
     raise click.ClickException(
-        f"the database in schema {schema!r} classifies as {found.value} against this CTRLRun "
+        f"the database in schema {schema!r} classifies as {found.value} against this ctrlrun "
         f"({len(applied)} migrations recorded). It is not safe to read as though it were HEAD."
     )
 
 
 def _peel_schema(url: str) -> tuple[str, str]:
-    """Take CTRLRun's own schema parameter off a Postgres URL before the driver sees it."""
+    """Take ctrlrun's own schema parameter off a Postgres URL before the driver sees it."""
     from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
     parts = urlsplit(url)
@@ -333,7 +364,7 @@ def _event(
 @click.group()
 @click.version_option(package_name="ctrlrun")
 def main() -> None:
-    """CTRLRun — the execution safety layer for AI agents."""
+    """ctrlrun — the execution safety layer for AI agents."""
 
 
 @main.command()
@@ -369,6 +400,22 @@ def approve(request_id: str, store_url: str | None) -> None:
         approval = store.grant_approval(request_id, CLI_APPROVER)
     except CTRLRunError as exc:
         raise _fail(exc) from exc
+    if approval is None:
+        # SPEC-v0.8 §4.4: recorded, and still short of the threshold the request pinned. No
+        # `APPROVAL_GRANTED` event, because nothing was granted yet: an event naming a grant that
+        # did not happen is the false-green shape in the evidence log (`v0.6 §7.2.3`'s argument).
+        after = store.get_approval(request_id)
+        recorded = 0 if after is None else len(after.approvers)
+        needed = 1 if after is None else after.request.approvals_required
+        click.echo(f"recorded {request_id}: {recorded} of {needed} approvals")
+        # §2.6: a CLI grant records no verified approver, so under M-of-N it never counts. Said
+        # here rather than left for an operator to infer from a number that does not move.
+        if recorded < needed:
+            click.echo(
+                "this answer carries no verified approver, so it will not count where the "
+                "deployment names an approver identity (SPEC-v0.8 §2.6)"
+            )
+        return
     if record is not None:
         store.append_event(
             _event(
@@ -450,13 +497,29 @@ def receipts(
         # document defines is not an error here -- it matches nothing, which is the right answer
         # for a reader running against a store whose policy has since changed. A dangling
         # citation is a *load* error, in the place that can see the registry.
-        found = tuple(receipt for receipt in found if control_id in receipt.controls)
+        # An unreadable row is **kept**, whatever the filter says (SPEC-v0.11 §5.2). Its
+        # `controls` could not be read, so it cannot be shown not to cite this id, and dropping
+        # it would let one `UPDATE` hide a row from exactly the query an operator runs to find
+        # a control's evidence.
+        found = tuple(
+            receipt
+            for receipt in found
+            if isinstance(receipt, UnreadableReceipt) or control_id in receipt.controls
+        )
     if last is not None:
         found = found[-last:]
     if not found:
         click.echo("no receipts yet" if control_id is None else f"no receipts cite {control_id!r}")
         return
     for receipt in found:
+        if isinstance(receipt, UnreadableReceipt):
+            # SPEC-v0.11 §5.2: named in place, at its `seq`, and the rows around it still print.
+            click.echo(
+                json.dumps(receipt.to_dict(), ensure_ascii=False)
+                if as_json
+                else _unreadable_line(receipt)
+            )
+            continue
         click.echo(receipt.to_json() if as_json else _receipt_line(receipt))
 
 
@@ -489,6 +552,409 @@ def _report_chain(store: StateStore, *, as_json: bool) -> None:
         raise SystemExit(1)
 
 
+def _loaded_anchor_provider(dotted: str) -> AnchorProvider:
+    """The operator's own anchor provider, named as `module:attribute` (SPEC-v0.11 §3.2).
+
+    **An import path, because there is nothing else it could be.** §9 puts no RFC 3161 client in
+    the wheel: the kernel stays stdlib plus `pyyaml` and `click`, and a timestamp protocol client
+    is a network client. So the provider is the operator's code, and a command run from `cron`
+    needs a way to name it. `module:attribute` is the shape every Python tool uses for this.
+
+    The attribute may be the provider or a zero-argument callable returning one, because an
+    operator whose provider needs a connection has nowhere else to build it.
+
+    **The spec does not specify this**, and it is recorded as a decision rather than presented as
+    one: §9 freezes `ctrlrun anchor` as a command and says nothing about how it reaches the
+    provider.
+    """
+    module_name, _, attribute = dotted.partition(":")
+    if not module_name or not attribute:
+        raise click.UsageError(
+            f"--provider must be 'module:attribute', got {dotted!r}. It names the anchor provider "
+            "in your own code: ctrlrun ships none, because a timestamp client is a network client"
+        )
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise click.UsageError(
+            f"--provider {dotted}: {module_name} could not be imported: {exc}"
+        ) from exc
+    try:
+        found = getattr(module, attribute)
+    except AttributeError:
+        raise click.UsageError(
+            f"--provider {dotted}: {module_name} has no attribute {attribute!r}"
+        ) from None
+    provider = found() if callable(found) and not hasattr(found, "make") else found
+    for call in ("make", "check", "latest", "since"):
+        if not callable(getattr(provider, call, None)):
+            raise click.UsageError(
+                f"--provider {dotted}: an AnchorProvider needs make, check, latest and since "
+                f"(SPEC-v0.11 §3.2); this one has no {call}()"
+            )
+    return cast(AnchorProvider, provider)
+
+
+@main.command(name="anchor")
+@click.option(
+    "--provider",
+    "dotted",
+    required=True,
+    metavar="MODULE:ATTR",
+    help="Your anchor provider (SPEC-v0.11 §3.2). ctrlrun ships none.",
+)
+@click.option(
+    "--verify",
+    "verify_only",
+    is_flag=True,
+    help="Check every anchor the provider holds against this chain, and make none.",
+)
+@click.option(
+    "--kind",
+    type=click.Choice(list(ANCHOR_KINDS)),
+    default=INTERVAL,
+    help="interval (the scheduled anchor) or checkpoint (a prune's).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Print the report as JSON.")
+@STORE_URL_OPTION
+def anchor_command(
+    dotted: str, verify_only: bool, kind: str, as_json: bool, store_url: str | None
+) -> None:
+    """Anchor this store's chain head outside the store, or check the anchors already made.
+
+    The chain detects alteration. It does not detect truncation or append, because the head that
+    would catch them is a row in the same database (SPEC-v0.6 §6.4). An anchor records the pair
+    the head holds somewhere your database's writer does not control.
+
+    **What it proves:** anything at or below an anchored seq can no longer be removed or altered
+    without the anchored pair failing to reproduce. **What it does not:** an append is not
+    detected, because it lands above every anchored seq; nor are receipts created and destroyed
+    between two anchors; nor who wrote any of it. The window you are exposed to is
+    (last anchored seq, current head], and its size is your choice of interval.
+    """
+    provider = _loaded_anchor_provider(dotted)
+    store = _store(store_url)
+    if verify_only:
+        _report_anchors(store, provider, as_json=as_json)
+        return
+    try:
+        made = make_anchor(store, provider, kind=kind)
+    except CTRLRunError as exc:
+        raise _fail(exc) from exc
+    if as_json:
+        click.echo(json.dumps(made.to_dict(), ensure_ascii=False, separators=(",", ":")))
+        return
+    click.echo(f"anchored seq {made.seq} ({made.kind}) at {iso_timestamp(made.at)}")
+    click.echo(f"  hash  {made.hash}")
+    click.echo(f"  token {made.token}")
+
+
+def _report_anchors(store: StateStore, provider: AnchorProvider, *, as_json: bool) -> None:
+    """`--verify` against the operator's own store, in `_report_chain`'s shape.
+
+    **Three outcomes, not two.** An unreachable provider is `unavailable`, which is neither ok
+    nor broken: refusing to act when you cannot ask is fail-closed, and reporting tampering when
+    you cannot ask is a false positive (SPEC-v0.11 §3.4). It still exits non-zero, because an
+    operator scripting this needs to know the check did not happen.
+    """
+    report = verify_anchors(store, provider)
+    if as_json:
+        click.echo(json.dumps(report.to_dict(), ensure_ascii=False, separators=(",", ":")))
+    elif report.unavailable:
+        click.echo(f"anchors: not checked. {report.reason}")
+    else:
+        click.echo(f"anchors: {report.checked} checked against this chain")
+        if report.superseded:
+            click.echo(
+                f"         {report.superseded} superseded by an anchored checkpoint "
+                "(a prune accounts for them)"
+            )
+        for problem in report.breaks:
+            where = "" if problem.seq is None else f" at seq {problem.seq}"
+            click.echo(f"  {problem.name}{where}: {problem.detail}")
+        if report.ok:
+            click.echo("every anchor reproduces")
+    if not report.ok:
+        raise SystemExit(1)
+
+
+@main.command(name="prune")
+@click.option(
+    "--through", type=int, required=True, metavar="SEQ", help="Delete receipts through this seq."
+)
+@click.option(
+    "--older-than",
+    "older_than",
+    required=True,
+    metavar="DURATION",
+    help="Refuse any COMMITTED ledger row newer than this (e.g. 90d). Use the longest window "
+    "on any budget of any grant.",
+)
+@click.option(
+    "--provider",
+    "dotted",
+    required=True,
+    metavar="MODULE:ATTR",
+    help="Your anchor provider. The prune anchors its checkpoint before deleting anything.",
+)
+@click.option("--by", required=True, metavar="WHO", help="Who is running this prune.")
+@click.option("--reason", required=True, help="Why. It goes in the receipt.")
+@click.option("--json", "as_json", is_flag=True, help="Print the result as JSON.")
+@STORE_URL_OPTION
+def prune_command(
+    through: int,
+    older_than: str,
+    dotted: str,
+    by: str,
+    reason: str,
+    as_json: bool,
+    store_url: str | None,
+) -> None:
+    """Delete receipts from the start of the chain, leaving it verifiable across the gap.
+
+    **This is the only command in this library that destroys evidence.** It takes a prefix,
+    never a suffix and never a middle: a suffix is the attack the anchor exists to catch, a
+    middle is a gap by construction, and only moving the chain's start can leave a chain
+    anybody can still verify.
+
+    It refuses rather than warns. A prune that would leave the chain reporting a break it did
+    not already report is refused with the seq named; so is one overlapping a hold, one through
+    the head, one moving the checkpoint backwards, and one that would delete a ledger row whose
+    charge is still held. There is no --force and there is not going to be one.
+
+    It anchors its checkpoint **before** it deletes anything, so a prune stays visible in your
+    anchor provider's own record even though the receipts are gone.
+    """
+    try:
+        window = _duration(older_than)
+    except InvalidArgument as exc:
+        raise click.UsageError(str(exc)) from exc
+    provider = _loaded_anchor_provider(dotted)
+    store = _store(store_url)
+    now = _utc_now()
+
+    # §4.5: **before** the lock, and this is forced rather than chosen. `put_receipt` opens
+    # `BEGIN IMMEDIATE` on the store's own connection, so a prune already holding that
+    # transaction cannot write through it:
+    #
+    #     writing the prune's receipt inside the prune's transaction ->
+    #         OperationalError: cannot start a transaction within a transaction
+    #
+    # The crash window is the safe one: a receipt for a prune that did not happen over-reports,
+    # where a prune with no receipt is indistinguishable from a truncation.
+    #
+    # The receipt records an **intent**, so a refused prune leaves one saying DENIED rather than
+    # one asserting an erasure that never happened.
+    intent = _prune_receipt(
+        through=through, older_than=older_than, by=by, reason=reason, now=now, stage="proposed"
+    )
+    try:
+        store.put_receipt(intent)
+    except CTRLRunError as exc:
+        raise _fail(exc) from exc
+
+    def _outcome(refusal: str | None = None) -> None:
+        """Record what became of the intent above, against the same `action_id`.
+
+        **Every prune leaves exactly two receipts, and they are distinguishable**, which an
+        independent review found they were not: a refused prune left an `allow`/`committed`
+        receipt beside the `deny` one, and a successful prune left an identical
+        `allow`/`committed` receipt, so the record could not tell an erasure that happened from
+        one that was refused. §4.2 says an operator deleting records should leave one, and a
+        receipt that over-states what happened is worse than none.
+        """
+        stage = "refused" if refusal is not None else "completed"
+        with suppress(CTRLRunError):
+            store.put_receipt(
+                replace(
+                    intent,
+                    receipt_id=new_receipt_id(),
+                    seq=None,
+                    prev_hash=None,
+                    hash=None,
+                    arguments={**dict(intent.arguments), "stage": stage},
+                    decision=Decision.DENY if refusal is not None else Decision.ALLOW,
+                    decision_reason="refused" if refusal is not None else intent.decision_reason,
+                    result=ReceiptResult.DENIED if refusal is not None else ReceiptResult.COMMITTED,
+                    error=refusal or "",
+                )
+            )
+
+    try:
+        result = prune(store, through=through, older_than=window, anchor=provider, now=now)
+    except CTRLRunError as exc:
+        _outcome(str(exc))
+        raise _fail(exc) from exc
+    _outcome()
+
+    if as_json:
+        click.echo(json.dumps(result.to_dict(), ensure_ascii=False, separators=(",", ":")))
+        return
+    click.echo(f"pruned through seq {result.through}")
+    click.echo(f"  receipts deleted     {result.receipts_deleted}")
+    click.echo(f"  ledger rows deleted  {result.ledger_rows_deleted}")
+    if result.checkpoint is not None:
+        click.echo(
+            f"  checkpoint           seq {result.checkpoint.seq} ({result.checkpoint.schema})"
+        )
+    click.echo("  the checkpoint was anchored before anything was deleted")
+
+
+@main.group(name="hold")
+def hold_group() -> None:
+    """Refuse to prune a range of receipts, until a person says otherwise.
+
+    There is no expiry. A hold that lapsed on a timer would release evidence on a schedule
+    nobody reviewed, which is the rule SPEC-v0.9 §4 already states about a budget hold.
+    """
+
+
+@hold_group.command(name="place")
+@click.option("--id", "hold_id", required=True, help="A name for this hold.")
+@click.option("--from-seq", "from_seq", type=int, required=True, help="The first seq held.")
+@click.option(
+    "--to-seq",
+    "to_seq",
+    type=int,
+    default=None,
+    help="The last seq held. Omit to hold to the end of the chain and everything after it.",
+)
+@click.option("--reason", required=True, help="Why. A prune that overlaps this prints it.")
+@click.option("--by", required=True, metavar="WHO", help="Who placed it.")
+@STORE_URL_OPTION
+def hold_place(
+    hold_id: str,
+    from_seq: int,
+    to_seq: int | None,
+    reason: str,
+    by: str,
+    store_url: str | None,
+) -> None:
+    """Place a hold."""
+    if from_seq < 1:
+        raise click.UsageError(f"--from-seq must be at least 1, got {from_seq}")
+    if to_seq is not None and to_seq < from_seq:
+        raise click.UsageError(f"--to-seq {to_seq} is below --from-seq {from_seq}")
+    store = _store(store_url)
+    try:
+        store.put_hold(
+            Hold(
+                hold_id=hold_id,
+                from_seq=from_seq,
+                to_seq=to_seq,
+                reason=reason,
+                placed_by=by,
+                placed_at=_utc_now(),
+            )
+        )
+    except CTRLRunError as exc:
+        raise _fail(exc) from exc
+    where = f"{from_seq}.." + ("end" if to_seq is None else str(to_seq))
+    click.echo(f"held {where}: {reason}")
+
+
+@hold_group.command(name="release")
+@click.option("--id", "hold_id", required=True, help="The hold to end.")
+@click.option("--by", required=True, metavar="WHO", help="Who is ending it.")
+@STORE_URL_OPTION
+def hold_release(hold_id: str, by: str, store_url: str | None) -> None:
+    """End a hold. A person ends it; nothing else does."""
+    store = _store(store_url)
+    try:
+        store.release_hold(hold_id, by=by, at=_utc_now())
+    except CTRLRunError as exc:
+        raise _fail(exc) from exc
+    click.echo(f"released {hold_id}")
+
+
+@hold_group.command(name="list")
+@click.option("--json", "as_json", is_flag=True, help="Print the holds as JSON.")
+@STORE_URL_OPTION
+def hold_list(as_json: bool, store_url: str | None) -> None:
+    """Show every hold this store knows about, live or released."""
+    store = _store(store_url)
+    try:
+        found = store.holds()
+    except CTRLRunError as exc:
+        raise _fail(exc) from exc
+    if as_json:
+        click.echo(json.dumps([item.to_dict() for item in found], ensure_ascii=False))
+        return
+    if not found:
+        click.echo("no holds")
+        return
+    for item in found:
+        where = f"{item.from_seq}.." + ("end" if item.to_seq is None else str(item.to_seq))
+        state = "live" if item.live else f"released by {item.released_by}"
+        click.echo(f"{item.hold_id}  {where}  {state}  {item.reason}")
+
+
+def _duration(text: str) -> timedelta:
+    """`90d`, `36h`, `15m`. The operator supplies the window; the kernel does not derive it.
+
+    SPEC-v0.11 §4.4 (O7): a ledger row carries `grant_id`, `metric`, `amount`, `effect_key`,
+    `attempt`, `consumed_at` and `released_at`, and **no window and no limit**. Those travel on
+    `Charge`, from the authority document, and a store that resolved a grant's budgets would be
+    reading the policy, which ARCHITECTURE.md §6 forbids.
+
+    Deriving it here would also have two failure modes with no good answer: a row whose
+    `grant_id` has left the document has no window at all, and a window an operator lengthens
+    later would retroactively un-prune rows already pruned.
+    """
+    units = {"d": "days", "h": "hours", "m": "minutes", "s": "seconds"}
+    if len(text) < 2 or text[-1] not in units or not text[:-1].isdigit():
+        raise InvalidArgument(
+            f"--older-than must be a number and one of d, h, m, s (e.g. 90d), got {text!r}"
+        )
+    return timedelta(**{units[text[-1]]: int(text[:-1])})
+
+
+def _prune_receipt(
+    *, through: int, older_than: str, by: str, reason: str, now: datetime, stage: str
+) -> Receipt:
+    """The receipt a prune writes before it takes the lock (§4.2, §4.5).
+
+    **Not routed through `Control.execute`**, and §4.2 is why: the gate is
+    `if self._require_approved_policy and action.name != POLICY_CHANGE_ACTION`, so a prune as an
+    ordinary action would be refused on a deployment that had not approved its current policy,
+    and a store that cannot prune is a store that fills. A prune is an operator's act at the CLI
+    and what authorises it is shell access to the store, which policy does not mediate.
+
+    **And the receipt is not what the walk trusts.** A receipt naming itself a checkpoint is a
+    string in a document; the checkpoint row is what `verify_chain` reads. This is for a human.
+    """
+    # **`older_than` is in the record**, and an independent review found it was not. It is the
+    # single input that decides whether the prune destroyed budget ledger rows, and therefore
+    # whether authority was handed back: a receipt that omits it cannot answer the one question
+    # somebody reading it afterwards would ask.
+    action = Action(
+        name=PRUNE_ACTION,
+        arguments={
+            "through": through,
+            "older_than": older_than,
+            "reason": reason,
+            "stage": stage,
+        },
+        principal=Principal(agent=by),
+    )
+    return Receipt(
+        receipt_id=new_receipt_id(),
+        action_id=action.action_id,
+        action=action.name,
+        action_hash=action.action_hash,
+        principal=action.principal,
+        resource=action.resource,
+        arguments=action.canonical_arguments,
+        environment=action.environment,
+        decision=Decision.ALLOW,
+        decision_reason="an operator's act at the CLI; policy does not mediate shell access",
+        # The intent is **proposed**, not committed: what happened is on the second receipt.
+        result=ReceiptResult.COMMITTED if stage != "proposed" else ReceiptResult.BLOCKED,
+        started_at=now,
+        finished_at=now,
+    )
+
+
 @main.command()
 @click.option(
     "--state",
@@ -498,16 +964,56 @@ def _report_chain(store: StateStore, *, as_json: bool) -> None:
 )
 @STORE_URL_OPTION
 def effects(state: str | None, store_url: str | None) -> None:
-    """Show the logical effects this store knows about."""
+    """Show the logical effects this store knows about.
+
+    An effect that still **holds** part of a budget says so (SPEC-v0.9 §7.2): `--state ambiguous`
+    is how an operator finds what is pinning a grant, and the hold is the reason it matters.
+    """
     try:
-        found = _store(store_url).list_effects(None if state is None else EffectState(state))
+        store = _store(store_url)
+        found = store.list_effects(None if state is None else EffectState(state))
+        holds = _holds_by_effect(store)
     except CTRLRunError as exc:
         raise _fail(exc) from exc
     if not found:
         click.echo("no effects yet" if state is None else f"no effects are {state}")
         return
     for record in found:
-        click.echo(_effect_line(record))
+        line = _effect_line(record)
+        charges = holds.get(record.effect_key)
+        if charges:
+            # **"spent" for a committed effect, "holds" for every other.** §7.2 defines `held`
+            # as the part of the sum whose effects have not committed, and a committed spend is
+            # a spend (§4.2): calling it a hold here would have `ctrlrun effects` and
+            # `ctrlrun inspect --grant` use one word for two different numbers.
+            verb = "spent" if record.state is EffectState.COMMITTED else "holds"
+            line += f"  {verb} " + ", ".join(charges)
+        click.echo(line)
+
+
+def _holds_by_effect(store: StateStore) -> dict[str, list[str]]:
+    """Un-released charges per effect key, whatever state the effect is in (SPEC-v0.9 §7.2).
+
+    "Un-released" is not "held": a committed effect's charge is never released, because a
+    committed spend is a spend. The caller picks the word from the effect's own state.
+
+    Read once and indexed rather than queried per effect: `ctrlrun effects` lists every effect
+    in the store, and a lookup inside that loop is one query per row.
+
+    A store with no ledger returns nothing, so this stays a diagnostic that works against a
+    0.8.0 database rather than one that refuses it.
+    """
+    try:
+        rows = store.consumptions()
+    except CTRLRunError:
+        return {}
+    held: dict[str, list[str]] = {}
+    for row in rows:
+        if row.released_at is None:
+            held.setdefault(row.effect_key, []).append(
+                f"{row.amount} {row.metric} on {row.grant_id}"
+            )
+    return held
 
 
 @main.command()
@@ -546,11 +1052,54 @@ def resolve(effect_key: str, committed: bool, failed: bool, store_url: str | Non
 
 
 @main.command()
-@click.argument("action_id")
+@click.argument("action_id", required=False)
+@click.option(
+    "--grant",
+    "grant_id",
+    help="Show this grant's budgets instead: consumed, held, and what holds it.",
+)
+@click.option(
+    "--hop",
+    "hop_id",
+    help="Show this hop or delegation instead: who issued it, and what each link narrowed.",
+)
 @click.option("--json", "as_json", is_flag=True, help="Emit one JSON object instead.")
 @STORE_URL_OPTION
-def inspect(action_id: str, as_json: bool, store_url: str | None) -> None:
-    """Show one action's whole history: proposal, decision, approval, effect, receipt."""
+def inspect(
+    action_id: str | None,
+    grant_id: str | None,
+    hop_id: str | None,
+    as_json: bool,
+    store_url: str | None,
+) -> None:
+    """Show one action's whole history: proposal, decision, approval, effect, receipt.
+
+    With `--grant`, show that grant's budgets instead: how much of each is consumed over its
+    rolling window, how much of that is **held** by effects that have not committed, and which
+    effect holds each part (SPEC-v0.9 §7.2).
+
+    The third number is the one that matters at 3am. A budget that refuses while it looks
+    nowhere near its limit is almost always one unresolved effect: `ctrlrun resolve` clears it.
+    """
+    given = [
+        name
+        for name, value in (("ACTION_ID", action_id), ("--grant", grant_id), ("--hop", hop_id))
+        if value
+    ]
+    if len(given) != 1:
+        # `v0.9 §7.1` keeps them behind one command, which makes "which of these did you mean"
+        # this command's own question. None names a subject; each names two.
+        raise click.UsageError(
+            "give exactly one of ACTION_ID, --grant GRANT_ID or --hop DELEGATION_ID: they "
+            "inspect different things"
+        )
+    if grant_id is not None:
+        _inspect_grant(grant_id, as_json, store_url)
+        return
+    if hop_id is not None:
+        _inspect_hop(hop_id, as_json, store_url)
+        return
+    assert action_id is not None
     store = _store(store_url)
     try:
         # SPEC-mcp-operator §9.1 — one producer for `ctrlrun.inspection/v2`, choosing included,
@@ -558,7 +1107,12 @@ def inspect(action_id: str, as_json: bool, store_url: str | None) -> None:
         # today are two that disagree later (T193).
         document = inspection_for(store, action_id)
         events = tuple(event for event in store.events() if event.action_id == action_id)
-        receipt = next((found for found in store.receipts() if found.action_id == action_id), None)
+        # `_readable`: a row that cannot be read carries no `action_id`, so it can never be
+        # the receipt for *this* action. SPEC-v0.11 §2.3's sharp case is exactly this line:
+        # `inspect` on an action the tamper never touched used to raise here.
+        receipt = next(
+            (found for found in _readable(store.receipts()) if found.action_id == action_id), None
+        )
     except CTRLRunError as exc:
         raise _fail(exc) from exc
 
@@ -576,6 +1130,80 @@ def inspect(action_id: str, as_json: bool, store_url: str | None) -> None:
     effect = _effect_of(store, receipt, events)
     for line in _inspection_lines(action_id, receipt, effect, approvals, events):
         click.echo(line)
+
+
+def _inspect_hop(hop_id: str, as_json: bool, store_url: str | None) -> None:
+    """SPEC-v0.10 §6.2, behind `ctrlrun inspect --hop`.
+
+    Answers about a **hop or an ordinary delegation alike**, because an operator paged about a
+    refusal does not yet know which kind they have: `created_via` is rendered rather than filtered
+    on.
+    """
+    try:
+        control = _control_on(store_url)
+        authority = control._authority
+        if authority is None:
+            raise click.ClickException(
+                "this configuration has no 'authority:' section, so it holds no hops "
+                "(SPEC-v0.3 §4.1)"
+            )
+        document = hop_document(hop_id, authority, control._store)
+        if document is None:
+            # Exits non-zero with nothing on stdout, as `inspect` does for an unknown action, so
+            # a script cannot mistake "no such hop" for "a hop with no chain".
+            raise click.ClickException(f"no hop {hop_id}")
+    except CTRLRunError as exc:
+        raise _fail(exc) from exc
+    if as_json:
+        click.echo(json.dumps(document, ensure_ascii=False, indent=2))
+        return
+    for line in hop_lines(document):
+        click.echo(line)
+
+
+def _inspect_grant(grant_id: str, as_json: bool, store_url: str | None) -> None:
+    """SPEC-v0.9 §7.2, behind `ctrlrun inspect --grant`.
+
+    The grant's budgets come from the **authority in force**, document grants and runtime
+    delegations alike, because a delegation carries budgets of its own (§2.6) and an operator
+    paged about one needs the same three numbers. The ledger is keyed on the grant id either
+    way, so the read below does not care which kind it found.
+    """
+    try:
+        control = _control_on(store_url)
+        budgets = _budgets_of(control, grant_id)
+        if budgets is None:
+            # Exits non-zero with nothing on stdout, as `inspect` does for an unknown action, so
+            # a script cannot mistake "no such grant" for "a grant with no budgets".
+            raise click.ClickException(f"no grant {grant_id}")
+        document = budget_document(grant_id, budgets, control._store, control._clock())
+    except CTRLRunError as exc:
+        raise _fail(exc) from exc
+    if as_json:
+        click.echo(json.dumps(document, ensure_ascii=False, indent=2))
+        return
+    for line in budget_lines(document):
+        click.echo(line)
+
+
+def _budgets_of(control: Control, grant_id: str) -> tuple[Budget, ...] | None:
+    """This grant's budgets, or `None` where no such grant exists.
+
+    `()` and `None` are different answers and the caller treats them differently: a grant that
+    budgets nothing is a real grant an operator may ask about, and §7.2's view says so.
+    """
+    authority = control._authority
+    if authority is None:
+        return None
+    grant = authority.grants.get(grant_id)
+    if grant is not None:
+        return grant.budgets or ()
+    record = control._store.get_delegation(grant_id)
+    if record is None:
+        return None
+    # Stored as JSON, so it is read back through the loader that validates it rather than
+    # trusted: §2.4's refusals apply to a row a text editor could have written.
+    return grant_from_json(record.grant_json, delegation_id=grant_id).budgets or ()
 
 
 def _approvals_for(
@@ -744,14 +1372,25 @@ def stats(since: str | None, as_json: bool, store_url: str | None) -> None:
         # kernel's own refusal; the exit code an operator scripts against stays 2.
         raise click.UsageError(str(exc)) from exc
     try:
+        rows = _store(store_url).receipts()
+        # A refused row has no `finished_at` to compare and no result to count, so it cannot
+        # enter a total. It is reported separately below rather than dropped in silence: a
+        # count that quietly omitted it would be `SPEC-v0.4 §3.8`'s false green (§5.2).
         counted = [
             receipt
-            for receipt in _store(store_url).receipts()
+            for receipt in _readable(rows)
             if boundary is None or receipt.finished_at >= boundary
         ]
+        unreadable = tuple(row for row in rows if isinstance(row, UnreadableReceipt))
     except CTRLRunError as exc:
         raise _fail(exc) from exc
-    document = stats_document(counted, mode=policy.mode, boundary=boundary)
+    document = stats_document(
+        counted,
+        mode=policy.mode,
+        boundary=boundary,
+        ledger_rows=ledger_rows(_store(store_url)),
+        unreadable=len(unreadable),
+    )
     if as_json:
         click.echo(json.dumps(document, ensure_ascii=False, indent=2))
         return
@@ -762,7 +1401,7 @@ def stats(since: str | None, as_json: bool, store_url: str | None) -> None:
 def _stats_lines(document: Mapping[str, Any]) -> list[str]:
     """§6.4's report. Every number comes from the document, so `--json` cannot disagree."""
     window = f"{document['from'] or '-'} .. {document['to'] or '-'}"
-    lines = [f"CTRLRun — {window}   ({document['mode']} mode)", ""]
+    lines = [f"ctrlrun — {window}   ({document['mode']} mode)", ""]
     lines.append(_stat("actions", document["actions"]))
     if document["mode"] == OBSERVE:
         lines.append(_stat("would have been denied", document["would_have_been_denied"]))
@@ -774,6 +1413,15 @@ def _stats_lines(document: Mapping[str, Any]) -> list[str]:
         lines.append(_stat("denied", document["denied"]))
         lines += _breakdown(document["denied_by_reason"])
     lines.append(_stat("ambiguous outcomes", document["ambiguous_outcomes"]))
+    if "ledger_rows" in document:
+        # §7.3: growth is observable before it is a problem.
+        lines.append(_stat("budget ledger rows", document["ledger_rows"]))
+    if "unreadable_receipts" in document:
+        # SPEC-v0.11 §5.2. Present only where there is one, so a clean store prints what it
+        # printed at 0.10.0 (§5.3). Without this line `actions` silently under-counts a store
+        # with a tampered row in it and the operator reading the terminal sees nothing at all,
+        # which is the number reading as a verdict about a store nobody could fully read.
+        lines.append(_stat("unreadable receipts", document["unreadable_receipts"]))
     lines.append("")
     if document["mode"] != OBSERVE:
         # §6.4 — say what is missing rather than print a line the receipts cannot substantiate.
@@ -782,6 +1430,11 @@ def _stats_lines(document: Mapping[str, Any]) -> list[str]:
             "and ambiguous breakdown is not reported."
         )
     lines.append("Actions still awaiting a human have no receipt yet and are not counted.")
+    if "unreadable_receipts" in document:
+        lines.append(
+            "Some rows could not be read back as receipts and are not counted above. Run "
+            "`ctrlrun receipts --verify-chain` to see where."
+        )
     return lines
 
 
@@ -930,28 +1583,287 @@ def delegate(
     click.echo(f"revoke it with: ctrlrun revoke {created.delegation_id}")
 
 
-@main.command()
-@click.argument("delegation_id")
-@click.option("--by", "by", default=CLI_APPROVER, show_default=True, help="Who revoked it.")
+@main.group()
+def policy() -> None:
+    """Propose a policy change, or replay one against what already happened.
+
+    A policy is the one file that decides every other decision, and until v0.8 it was changed
+    by editing it. v0.6 made the change evidenced: every receipt records the hash of the policy
+    that decided it. v0.8 makes it approved: **a policy nobody approved decides nothing**, in a
+    deployment that asks for that with `Control(require_approved_policy=True)`.
+
+    There is no `ctrlrun policy approve`. A proposal is an ordinary approval request, so the
+    command that answers it is `ctrlrun approve`, and a second one would be a second approval
+    path (SPEC-v0.8 §8.3).
+    """
+
+
+@policy.command("propose")
+@click.option(
+    "--file",
+    "candidate_file",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="The policy being proposed. It is not installed; approving its hash is what this does.",
+)
+@click.option(
+    "--approval", "approval_id", default=None, help="Present an approval already granted."
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit one JSON object instead.")
 @STORE_URL_OPTION
-def revoke(delegation_id: str, by: str, store_url: str | None) -> None:
+def policy_propose(
+    candidate_file: Path,
+    approval_id: str | None,
+    as_json: bool,
+    store_url: str | None,
+) -> None:
+    """Propose a policy change under the policy currently in force.
+
+    The candidate is loaded, its hash computed **the way the Control that will enforce it
+    computes its own** -- with this deployment's authority and environment folded in, so an
+    approval is per deployment -- and the change runs through the ordinary approval path. A
+    committed receipt for that action is the approval of that hash.
+
+    This does not install the file. Installing it is the operator's act; what needs approving
+    is the hash, and the two are deliberately separate so that approving cannot be the thing
+    that changes what is running.
+
+    **There is no `--as`**, for the reason `ctrlrun break-glass` has none (SPEC-v0.8 §5.3.1).
+    The property this whole flow buys is that a **second, verified** person answered, and a
+    proposer typed at a shell defeats it in one line: propose as somebody else, approve with
+    your own verified credential, and the requester-is-not-approver check sees two principals.
+    The proposer is whoever the deployment resolves, or `ctrlrun.context(...)`.
+    """
+    from ..policy import Policy
+
+    try:
+        control = _control_on(store_url)
+        candidate = Policy.from_file(candidate_file)
+        receipt = control._propose_policy(
+            candidate, authority=control.authority, approval_id=approval_id
+        )
+    except ApprovalRequired as pending:
+        click.echo(f"proposed {pending.request_id}")
+        click.echo(f"approve it with: ctrlrun approve {pending.request_id}")
+        click.echo(
+            f"then: ctrlrun policy propose --file {candidate_file} --approval {pending.request_id}"
+        )
+        return
+    except CTRLRunError as exc:
+        raise _fail(exc) from exc
+    if as_json:
+        click.echo(json.dumps(receipt.to_dict(), ensure_ascii=False))
+        return
+    click.echo(f"{receipt.result} {receipt.arguments['to']}")
+
+
+@policy.command("replay")
+@click.option(
+    "--file",
+    "candidate_file",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="The proposed policy to evaluate the recorded actions against.",
+)
+@click.option("--last", "limit", default=100, show_default=True, help="How many receipts to read.")
+@click.option("--json", "as_json", is_flag=True, help="Emit one JSON object instead.")
+@STORE_URL_OPTION
+def policy_replay(candidate_file: Path, limit: int, as_json: bool, store_url: str | None) -> None:
+    """Report which recorded decisions would change under a proposed policy.
+
+    It writes nothing, executes nothing and reserves nothing. It reports **what changes** and
+    never whether a policy is safer, riskier or too permissive: this kernel does not grade an
+    operator's document, and a replay that scored one would be the same claim in a new costume
+    (SPEC-v0.8 §8.5).
+
+    A receipt whose action cannot be rebuilt is named and skipped, never counted as unchanged.
+    """
+    from ..policy import Policy
+
+    try:
+        control = _control_on(store_url)
+        rows = control._replay_policy(Policy.from_file(candidate_file), limit=limit)
+    except CTRLRunError as exc:
+        raise _fail(exc) from exc
+    if as_json:
+        click.echo(json.dumps({"changed": rows}, ensure_ascii=False))
+        return
+    if not rows:
+        click.echo(f"no recorded decision changes under {candidate_file}")
+        return
+    for row in rows:
+        if "skipped" in row:
+            click.echo(f"{row['receipt_id']}  {row['action']}  skipped: {row['skipped']}")
+            continue
+        click.echo(
+            f"{row['receipt_id']}  {row['action']}  "
+            f"{row['from']['decision']} ({row['from']['reason']})  ->  "
+            f"{row['to']['decision']} ({row['to']['reason']})"
+        )
+
+
+@main.command()
+@click.argument("delegation_id", required=False)
+@click.option("--by", "by", default=CLI_APPROVER, show_default=True, help="Who revoked it.")
+@click.option(
+    "--created-by",
+    "created_by",
+    default=None,
+    help="Revoke every delegation this principal created: AGENT or AGENT/USER.",
+)
+@click.option(
+    "--under",
+    "under",
+    default=None,
+    help="Revoke every delegation beneath this grant or delegation id, at any depth.",
+)
+@STORE_URL_OPTION
+def revoke(
+    delegation_id: str | None,
+    by: str,
+    created_by: str | None,
+    under: str | None,
+    store_url: str | None,
+) -> None:
     """Revoke a delegation, and with it every delegation beneath it.
 
     Transitive by structure and not reversible: there is no `unrevoke`, because the operation
     whose safety matters is the one taken in a hurry (SPEC-v0.3 §5.7). Revoking an
     already-revoked delegation is idempotent and exits 0.
+
+    `--created-by` and `--under` are selectors over rows that already exist (SPEC-v0.8 §7).
+    Each match is revoked **exactly as one id is**: one revocation, one record, one event, in
+    turn, so a run that stops halfway leaves the rows it reached revoked and the rest untouched,
+    and a second run finishes. A selector that matches nothing exits non-zero (§7.5), because
+    during an incident a mistyped name that exits 0 reads as "done".
+
+    `--by` is unchanged and means what it has always meant: who performed the revocation.
     """
+    selected = _one_selector(delegation_id, created_by, under)
     try:
         control = _control_on(store_url)
-        before = control.store.get_delegation(delegation_id)
-        control.revoke(delegation_id, by=by)
+        if selected is None:
+            _revoke_one(control, str(delegation_id), by)
+            return
+        _revoke_selected(control, selected, by)
     except CTRLRunError as exc:
         raise _fail(exc) from exc
+
+
+def _one_selector(
+    delegation_id: str | None, created_by: str | None, under: str | None
+) -> tuple[str, str] | None:
+    """`None` for a single id, or the one selector given, as `(kind, value)` (SPEC-v0.8 §7.2).
+
+    Two ways of naming what to revoke in one invocation is a command whose blast radius depends
+    on which the reader believes, so every combination is a usage error rather than a precedence
+    rule nobody would remember at 3am.
+    """
+    named = [name for name, value in (("--created-by", created_by), ("--under", under)) if value]
+    if len(named) > 1:
+        raise click.UsageError("--created-by and --under name different sets; give one of them")
+    if named and delegation_id is not None:
+        raise click.UsageError(
+            f"{named[0]} selects the rows to revoke, so a delegation id cannot be given as well"
+        )
+    if not named:
+        if delegation_id is None:
+            raise click.UsageError("give a delegation id, or --created-by PRINCIPAL, or --under ID")
+        return None
+    return ("--created-by", created_by) if created_by else ("--under", str(under))
+
+
+def _revoke_one(control: Control, delegation_id: str, by: str) -> None:
+    """One id, exactly as v0.3 §5.7 revoked it, and the shape a selector run repeats."""
+    before = control.store.get_delegation(delegation_id)
+    control.revoke(delegation_id, by=by)
     if before is not None and before.revoked_at is not None:
         click.echo(f"{delegation_id} was already revoked at {iso_timestamp(before.revoked_at)}")
         return
     click.echo(f"revoked {delegation_id} by {by}")
     click.echo("every delegation beneath it is denied from the next evaluation")
+
+
+def _revoke_selected(control: Control, selected: tuple[str, str], by: str) -> None:
+    """Every row the selector matches, one at a time (SPEC-v0.8 §7.3, §7.4)."""
+    kind, value = selected
+    rows = control.store.delegations(include_revoked=True)
+    matched = _created_by(rows, value) if kind == "--created-by" else _beneath(rows, value)
+    if not matched:
+        raise click.ClickException(
+            f"no delegation matched {kind} {value!r}; nothing was revoked. A selector that "
+            "matched nothing exits non-zero so a mistyped name does not read as a finished job"
+        )
+    already = [record for record in matched if record.is_revoked]
+    for record in matched:
+        if record.is_revoked:
+            continue
+        # One at a time, through the same call a single id takes: a bulk write would leave a
+        # killed run with rows nobody can account for, and there is no transaction over the set.
+        control.revoke(record.delegation_id, by=by)
+        click.echo(f"revoked {record.delegation_id} by {by}")
+    click.echo(
+        f"revoked {len(matched) - len(already)} of {len(matched)} matching "
+        f"{kind} {value}; {len(already)} already revoked"
+    )
+    click.echo("every delegation beneath them is denied from the next evaluation")
+
+
+def _created_by(rows: tuple[DelegationRecord, ...], value: str) -> list[DelegationRecord]:
+    """The rows this principal created: AGENT, or AGENT/USER (SPEC-v0.8 §7.3).
+
+    Split on the first '/', as `delegate --as` splits, and refusing the same thing it refuses:
+    a name with two separators is ambiguous, and a selector nobody can read is one that revokes
+    the wrong subtree during an incident.
+    """
+    agent, separator, user = value.partition("/")
+    if not agent:
+        raise click.UsageError("--created-by needs an agent name: AGENT or AGENT/USER")
+    if separator and not user:
+        # `--created-by agent/` is a typed-and-lost user, not "any user": reading it as the
+        # latter would revoke every row that agent created, which is the widest reading of an
+        # ambiguous command during an incident. Refused rather than guessed.
+        raise click.UsageError(
+            f"--created-by {value!r} ends with '/': write AGENT for every user, or AGENT/USER "
+            "for one"
+        )
+    if "/" in user:
+        raise click.UsageError(
+            f"--created-by {value!r} has more than one '/': write AGENT or AGENT/USER, and note "
+            "that an agent name containing '/' cannot be written, as 'delegate --as' says"
+        )
+    return [
+        record
+        for record in rows
+        if record.created_by_agent == agent and (not separator or record.created_by_user == user)
+    ]
+
+
+def _beneath(rows: tuple[DelegationRecord, ...], parent_id: str) -> list[DelegationRecord]:
+    """Every row whose parent chain reaches `parent_id`, at any depth (SPEC-v0.8 §7.3).
+
+    Strictly beneath: a row is not under itself, so `--under <a delegation>` revokes that
+    delegation's descendants and leaves it alone, which is what the words say.
+
+    The walk is bounded by the rows it has already seen, because a chain edited into a cycle
+    with `sqlite3` and a text editor is reachable (SPEC-v0.3 §5.5 makes the same point about
+    evaluation) and an incident command must not hang on one.
+    """
+    by_id = {record.delegation_id: record for record in rows}
+    matched = []
+    for record in rows:
+        seen: set[str] = {record.delegation_id}
+        current = record.parent_id
+        while current not in seen:
+            if current == parent_id:
+                matched.append(record)
+                break
+            seen.add(current)
+            parent = by_id.get(current)
+            if parent is None:
+                break
+            current = parent.parent_id
+    return matched
 
 
 def _delegation_dict(delegation: Delegation) -> dict[str, Any]:
@@ -970,6 +1882,14 @@ def _delegation_dict(delegation: Delegation) -> dict[str, Any]:
 @main.command(name="mcp-operator")
 @click.option("--listen", default="127.0.0.1:8901", show_default=True, help="HOST:PORT.")
 @click.option("--path", default="/mcp", show_default=True, help="The MCP endpoint path.")
+@click.option(
+    "--stdio",
+    is_flag=True,
+    help="Speak MCP on stdin and stdout to the client that launched this process (a "
+    "desktop assistant, Cursor, an editor). Opens no socket. The approver is the account this "
+    "process runs as, read from the real uid; takes no header, JWT or origin flag "
+    "(SPEC-mcp-operator §2.3).",
+)
 @click.option(
     "--principal-header",
     default=None,
@@ -1039,10 +1959,19 @@ def _delegation_dict(delegation: Delegation) -> dict[str, Any]:
 @click.option("--identity-jwt-leeway", type=float, default=60.0, show_default=True)
 @click.option("--identity-jwt-jwks-min-refresh", type=float, default=30.0, show_default=True)
 @click.option("--identity-jwt-http-timeout", type=float, default=5.0, show_default=True)
+@click.option(
+    "--approver-roles-claim",
+    default=None,
+    help=(
+        "Which verified claim carries this issuer's roles, for the approver entitlement of "
+        "SPEC-v0.8 §3. Without it no role can be read, so any cited control naming one refuses."
+    ),
+)
 @STORE_URL_OPTION
 def mcp_operator(
     listen: str,
     path: str,
+    stdio: bool,
     principal_header: str | None,
     user_header: str | None,
     environment: str | None,
@@ -1058,6 +1987,7 @@ def mcp_operator(
     identity_jwt_audience: str | None,
     identity_jwt_token_type: str | None,
     identity_jwt_header: str,
+    approver_roles_claim: str | None,
     identity_jwt_agent_claim: str,
     identity_jwt_user_claim: str | None,
     identity_jwt_claims: tuple[str, ...],
@@ -1066,11 +1996,13 @@ def mcp_operator(
     identity_jwt_http_timeout: float,
     store_url: str | None,
 ) -> None:
-    """Answer approvals from an MCP client, over loopback (SPEC-mcp-operator.md).
+    """Answer approvals from an MCP client, over loopback or stdio (SPEC-mcp-operator.md).
 
     There is no --principal and no --allow-remote, and both absences are load-bearing: a
     static principal cannot attribute an answer to a person (§3.1), and a server whose read
-    tools answer without a credential must not be the one that opens a port (§2.1).
+    tools answer without a credential must not be the one that opens a port (§2.1). --stdio
+    opens none at all, and its approver is the one name the launching client cannot set: the
+    OS login of the process (§2.3).
     """
     host, _, port = listen.rpartition(":")
     try:
@@ -1084,6 +2016,7 @@ def mcp_operator(
             host=host or "127.0.0.1",
             port=int(port),
             path=path,
+            stdio=stdio,
             principal_header=principal_header,
             user_header=user_header,
             environment=environment,
@@ -1106,6 +2039,7 @@ def mcp_operator(
             identity_jwt_leeway=identity_jwt_leeway,
             identity_jwt_jwks_min_refresh=identity_jwt_jwks_min_refresh,
             identity_jwt_http_timeout=identity_jwt_http_timeout,
+            approver_roles_claim=approver_roles_claim,
         )
     except (ValueError, CTRLRunError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -1311,6 +2245,17 @@ def gateway(
         click.echo("")
 
 
+def _unreadable_line(row: UnreadableReceipt) -> str:
+    """One row this binary could not read back, named where the receipt would have printed.
+
+    SPEC-v0.11 §5.2, and rule 3: one tampered row costs one row. The refusal is printed **by
+    type** and never by message, because the canonicalizer quotes what it refused and a lone
+    surrogate echoed here is a line that cannot be printed.
+    """
+    at = "no seq" if row.seq is None else f"seq {row.seq}"
+    return f"{at}  {row.receipt_id or '-'}  UNREADABLE  this row could not be read ({row.refusal})"
+
+
 def _receipt_line(receipt: Receipt) -> str:
     return (
         f"{iso_timestamp(receipt.finished_at)}  {receipt.receipt_id}  {receipt.action}  "
@@ -1377,12 +2322,21 @@ def _effect_line(record: EffectRecord) -> str:
     "the list in force and exit.",
 )
 @click.option("--json", "as_json", is_flag=True, help="Emit one ctrlrun.scan/v1 document.")
+@click.option(
+    "--coverage",
+    "coverage_flag",
+    is_flag=True,
+    help="Also report what this store has never exercised (SPEC-v0.11 §7). Opens the store.",
+)
+@STORE_URL_OPTION
 def scan(
     root: Path | None,
     policy_path: Path | None,
     excludes: tuple[str, ...],
     vocabulary_path: str | None,
     as_json: bool,
+    coverage_flag: bool,
+    store_url: str | None,
 ) -> None:
     """Report the consequential call sites and policy entries nothing is covering.
 
@@ -1392,6 +2346,12 @@ def scan(
 
     It is a finder and not a proof. Every run prints what it could not look at, and a clean
     scan means nothing was found where it looked.
+
+    With --coverage it also reads a store and reports what this deployment declared and has
+    never exercised. **That half is a list and not a score**: no percentage, no ratio, no badge.
+    A policy entry nothing exercised may be correctly unused, and it says so. It does not move
+    the exit code, for the same reason: a number that ranked a deployment would be a verdict on
+    the operator's document, which this tool does not give.
 
     Exit codes: 0 nothing was found; 1 something was, including a suppressed finding or a
     call whose name could not be resolved; 2 the scan could not run.
@@ -1426,12 +2386,43 @@ def scan(
         click.echo(f"ctrlrun scan: {refused}", err=True)
         raise SystemExit(2) from refused
 
+    measured = None
+    if coverage_flag:
+        from ..coverage import coverage as run_coverage
+        from ..coverage import coverage_lines
+
+        store = _store(store_url)
+        try:
+            loaded = _loaded_policy() if policy_path is None else Policy.from_file(policy_path)
+            measured = run_coverage(
+                store,
+                policy_actions=sorted(loaded.actions),
+                protected_actions=sorted(
+                    {finding.name for finding in report.findings if finding.name is not None}
+                ),
+                policy_path=str(policy_path) if policy_path else None,
+            )
+        except CTRLRunError as exc:
+            raise _fail(exc) from exc
+
     if as_json:
-        click.echo(json_module.dumps(report_document(report), indent=2))
+        document = report_document(report)
+        if measured is not None:
+            # A **key**, not a merged document: `ctrlrun.scan/v1` answers a question about
+            # source and `ctrlrun.coverage/v1` answers one about a store, and folding them
+            # would make a consumer parse two shapes under one name.
+            document["coverage"] = measured.to_dict()
+        click.echo(json_module.dumps(document, indent=2))
     else:
         for line in report_lines(report):
             click.echo(line)
+        if measured is not None:
+            for line in coverage_lines(measured):
+                click.echo(line)
 
+    # **`--coverage` does not move the exit code** (rule 4). An unexercised policy entry is a
+    # fact about the record, not a finding about the operator, and an exit code that moved with
+    # it would be the score this item is forbidden to produce, wearing a shell's clothes.
     if report.exit_code:
         raise SystemExit(report.exit_code)
 

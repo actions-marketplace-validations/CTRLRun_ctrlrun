@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """Schema version and the forward-only migration runner. Build-list item 2; SPEC-v0.6 §3.
 
 Six places across v0.2, v0.3, v0.4 and v0.5 say *"there is still no migration story -- that is
@@ -294,6 +296,186 @@ _POLICY_PROVENANCE_PG: Final = (
     'ALTER TABLE approvals ADD COLUMN IF NOT EXISTS policy_hash_at_approval TEXT COLLATE "C"',
 )
 
+#: SPEC-v0.7 §6.11: the precondition fingerprint captured when an approval was requested. A
+#: column for `0004`'s reason: `ApprovalRecord` is rebuilt from columns, so a value the recheck
+#: reads back must be one. Nullable, and **not backfilled**: every approval requested before
+#: this migration was requested without a provider, which is exactly what `NULL` means.
+#:
+#: A hash and never the state it was computed from (§6.10), so this column holds nothing a
+#: reader of the approvals table could learn the resource's state from.
+_PRECONDITION_FINGERPRINT: Final = (
+    "ALTER TABLE approvals ADD COLUMN precondition_fingerprint TEXT",
+)
+_PRECONDITION_FINGERPRINT_PG: Final = (
+    'ALTER TABLE approvals ADD COLUMN IF NOT EXISTS precondition_fingerprint TEXT COLLATE "C"',
+)
+
+#: SPEC-v0.8 §11.1: what a verified approver is recorded in, and the two columns the request
+#: pins for items 3 and 4. Three columns and one migration, because they are one change to one
+#: table and a store has no use for a half of it.
+#:
+#: **`approvers` is `COLLATE "C"` on Postgres and the reason is not cosmetic.** Item 4 makes it
+#: a compare-and-set column, and a non-deterministic collation can make two distinct blobs
+#: compare equal, which fails the *unsafe* way: a compare-and-set that wrongly matches succeeds,
+#: and the lost update the CAS exists to close comes straight back, on exactly the deployments
+#: whose `lc_collate` is an ICU locale (§4.3).
+#:
+#: Nullable and **not backfilled**: every approval granted before this migration was granted by
+#: a surface that recorded no principal, which is exactly what `NULL` means, and which
+#: `Control` refuses at consumption wherever an approver identity is configured (§2.9).
+_VERIFIED_APPROVER: Final = (
+    "ALTER TABLE approvals ADD COLUMN approvers TEXT",
+    "ALTER TABLE approvals ADD COLUMN required_roles TEXT",
+    "ALTER TABLE approvals ADD COLUMN approvals_required INTEGER",
+)
+_VERIFIED_APPROVER_PG: Final = (
+    'ALTER TABLE approvals ADD COLUMN IF NOT EXISTS approvers TEXT COLLATE "C"',
+    'ALTER TABLE approvals ADD COLUMN IF NOT EXISTS required_roles TEXT COLLATE "C"',
+    "ALTER TABLE approvals ADD COLUMN IF NOT EXISTS approvals_required INTEGER",
+)
+
+#: SPEC-v0.9 §3.2, §3.5.1: the budget ledger. One row per consumption, per ancestor charged.
+#:
+#: **The unique constraint is `v0.6 §4.3.2` Table A1 row 2's doing, not tidiness.** A lost
+#: `COMMIT` with no record found retries the insert *once*, and the retried transaction re-inserts
+#: the reservation and its charges together. An unconstrained append would double-charge there,
+#: precisely when an operator's network is already misbehaving.
+#:
+#: **`released_at` is nullable and release is a compare-and-set on it, never a decrement**
+#: (§4.4). Table A2 row 2 re-issues a lost `UPDATE` once, and a decrement is not idempotent under
+#: a re-issue: the second one subtracts again and the operator's budget quietly grows.
+#:
+#: The index is what makes §2.5's rolling sum a range scan. Named here because a ledger without
+#: it is correct and unusable, and "correct and unusable" is how a governance control gets
+#: turned off (§3.5).
+_BUDGET_LEDGER: Final = (
+    """
+    CREATE TABLE budget_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        grant_id TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        amount INTEGER NOT NULL,
+        effect_key TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        consumed_at TEXT NOT NULL,
+        released_at TEXT,
+        UNIQUE (effect_key, attempt, grant_id, metric)
+    )
+    """,
+    "CREATE INDEX ix_budget_ledger_window ON budget_ledger (grant_id, metric, consumed_at)",
+)
+_BUDGET_LEDGER_PG: Final = (
+    """
+    CREATE TABLE IF NOT EXISTS budget_ledger (
+        id BIGSERIAL PRIMARY KEY,
+        grant_id TEXT NOT NULL COLLATE "C",
+        metric TEXT NOT NULL COLLATE "C",
+        amount BIGINT NOT NULL,
+        effect_key TEXT NOT NULL COLLATE "C",
+        attempt INTEGER NOT NULL,
+        consumed_at TIMESTAMPTZ NOT NULL,
+        released_at TIMESTAMPTZ,
+        UNIQUE (effect_key, attempt, grant_id, metric)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_budget_ledger_window
+        ON budget_ledger (grant_id, metric, consumed_at)
+    """,
+    # SPEC-v0.9 §3.6, measured rather than chosen: READ COMMITTED does not serialise a sum and an
+    # insert, and the spike overspent 1200 against a limit of 1000 in three runs of four. The
+    # anchor row is what `SELECT ... FOR UPDATE` takes before the sum. **Per grant and not per
+    # store**, so two budgets on two grants do not serialise against each other.
+    """
+    CREATE TABLE IF NOT EXISTS budget_anchor (
+        grant_id TEXT PRIMARY KEY COLLATE "C"
+    )
+    """,
+)
+
+#: SPEC-v0.11 §9 — the three tables items 2 and 3 need, in **one** migration, because §9 freezes
+#: the id `0008_anchor_checkpoint_hold` and a migration id is a name that cannot be amended once
+#: a store has applied it. Item 2 creates all three; item 3 fills `checkpoints` and `holds`.
+#:
+#: `anchors` is the **cache** and never the record (§3.3). The record is the operator's provider,
+#: outside the store, and that distinction is the whole of why an anchor is worth anything: a row
+#: here that somebody deleted is checked anyway, because `verify_anchors` asks the provider what
+#: it holds before it reads this table.
+#:
+#: `token` is the primary key rather than `seq`: a `seq` can legitimately carry both an `interval`
+#: and a `checkpoint` anchor (§3.2 orders the kinds separately), and a provider's token is the one
+#: value it promises to recognise again.
+_ANCHOR_CHECKPOINT_HOLD: Final = (
+    """
+    CREATE TABLE anchors (
+        token TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL,
+        hash TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX ix_anchors_seq ON anchors (kind, seq)",
+    # One row, `id = 1`, exactly as `receipt_chain` is: a store has one pruned-through point, and
+    # a table that could hold two is a table a reader has to choose from (SPEC-v0.11 §4.2).
+    """
+    CREATE TABLE prune_checkpoint (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        seq INTEGER NOT NULL,
+        hash TEXT NOT NULL,
+        schema TEXT NOT NULL,
+        at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE holds (
+        hold_id TEXT PRIMARY KEY,
+        from_seq INTEGER NOT NULL,
+        to_seq INTEGER,
+        reason TEXT NOT NULL,
+        placed_by TEXT NOT NULL,
+        placed_at TEXT NOT NULL,
+        released_at TEXT,
+        released_by TEXT
+    )
+    """,
+    "CREATE INDEX ix_holds_range ON holds (from_seq, to_seq)",
+)
+_ANCHOR_CHECKPOINT_HOLD_PG: Final = (
+    """
+    CREATE TABLE IF NOT EXISTS anchors (
+        token TEXT PRIMARY KEY COLLATE "C",
+        seq BIGINT NOT NULL,
+        hash TEXT NOT NULL COLLATE "C",
+        kind TEXT NOT NULL COLLATE "C",
+        at TIMESTAMPTZ NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_anchors_seq ON anchors (kind, seq)",
+    """
+    CREATE TABLE IF NOT EXISTS prune_checkpoint (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        seq BIGINT NOT NULL,
+        hash TEXT NOT NULL COLLATE "C",
+        schema TEXT NOT NULL COLLATE "C",
+        at TIMESTAMPTZ NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS holds (
+        hold_id TEXT PRIMARY KEY COLLATE "C",
+        from_seq BIGINT NOT NULL,
+        to_seq BIGINT,
+        reason TEXT NOT NULL COLLATE "C",
+        placed_by TEXT NOT NULL COLLATE "C",
+        placed_at TIMESTAMPTZ NOT NULL,
+        released_at TIMESTAMPTZ,
+        released_by TEXT COLLATE "C"
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_holds_range ON holds (from_seq, to_seq)",
+)
+
 #: The ordered set this binary knows. `NNNN_snake_name`: four digits, zero-padded, so
 #: lexicographic order is application order.
 MIGRATIONS: Final[tuple[Migration, ...]] = (
@@ -301,6 +483,22 @@ MIGRATIONS: Final[tuple[Migration, ...]] = (
     Migration("0002_receipt_chain", _RECEIPT_CHAIN, postgres=_RECEIPT_CHAIN_PG),
     Migration("0003_resolved_by", _RESOLVED_BY, postgres=_RESOLVED_BY_PG),
     Migration("0004_policy_provenance", _POLICY_PROVENANCE, postgres=_POLICY_PROVENANCE_PG),
+    Migration(
+        "0005_precondition_fingerprint",
+        _PRECONDITION_FINGERPRINT,
+        postgres=_PRECONDITION_FINGERPRINT_PG,
+    ),
+    Migration(
+        "0006_verified_approver",
+        _VERIFIED_APPROVER,
+        postgres=_VERIFIED_APPROVER_PG,
+    ),
+    Migration("0007_budget_ledger", _BUDGET_LEDGER, postgres=_BUDGET_LEDGER_PG),
+    Migration(
+        "0008_anchor_checkpoint_hold",
+        _ANCHOR_CHECKPOINT_HOLD,
+        postgres=_ANCHOR_CHECKPOINT_HOLD_PG,
+    ),
 )
 
 HEAD: Final = MIGRATIONS[-1].id
@@ -333,7 +531,7 @@ _SCHEMA_VERSION_TABLE: Final = """CREATE TABLE IF NOT EXISTS schema_version(
   ctrlrun_version TEXT NOT NULL
 )"""
 
-#: A table that means "this is a CTRLRun database from before v0.6". `effects` is the one table
+#: A table that means "this is a ctrlrun database from before v0.6". `effects` is the one table
 #: every release since v0.1 has had.
 _MARKER_TABLE: Final = "effects"
 
@@ -352,7 +550,7 @@ _COLUMN_QUERY: Final = {
 }
 _PLACEHOLDER: Final = {"sqlite": "?", "postgres": "%s"}
 
-#: The advisory-lock key every CTRLRun migration serialises on. Constant, so two processes
+#: The advisory-lock key every ctrlrun migration serialises on. Constant, so two processes
 #: migrating one database wait for each other; an advisory lock is scoped to the database it is
 #: taken in, so processes migrating different databases do not.
 _MIGRATION_LOCK: Final = 0x43545252554E
@@ -394,17 +592,17 @@ def classify(applied: tuple[str, ...]) -> Classification:
     return Classification.GAPPED
 
 
-#: What an `effects` table must have for a database to be CTRLRun's. Not the whole schema: a
+#: What an `effects` table must have for a database to be ctrlrun's. Not the whole schema: a
 #: v0.1 database has fewer tables than a v0.5 one, and the point is to tell *ours* from
 #: *somebody else's*, not to re-derive the version from the columns (§3.1).
 _EFFECTS_COLUMNS: Final = frozenset({"effect_key", "state", "action_id", "attempt"})
 
 
 def _refuse_unless_ours(connection: Any, tables: set[str], dialect: str) -> None:
-    """Adopt a pre-v0.6 database only if its `effects` table is actually CTRLRun's (§3.2).
+    """Adopt a pre-v0.6 database only if its `effects` table is actually ctrlrun's (§3.2).
 
     `effects` is a plausible name in somebody else's schema, and a `$CTRLRUN_STATE` typo is a
-    plausible way to arrive at one. Keying adoption on the name alone meant CTRLRun created
+    plausible way to arrive at one. Keying adoption on the name alone meant ctrlrun created
     `schema_version`, `approvals`, `receipts`, `events`, `delegations`, `continuations` and
     `receipt_chain` **inside the operator's other database**, recorded both migrations, opened
     cleanly, and failed at first use with `no such column: effect_key` -- which is after
@@ -414,9 +612,9 @@ def _refuse_unless_ours(connection: Any, tables: set[str], dialect: str) -> None
     missing = _EFFECTS_COLUMNS - columns
     if missing:
         raise _refuse(
-            f"this database has a table named {_MARKER_TABLE!r} that is not CTRLRun's: it is "
+            f"this database has a table named {_MARKER_TABLE!r} that is not ctrlrun's: it is "
             f"missing {', '.join(sorted(missing))}. It holds {', '.join(sorted(tables))}. "
-            "Creating CTRLRun's tables in somebody else's database is not a recovery.",
+            "Creating ctrlrun's tables in somebody else's database is not a recovery.",
             (),
         )
 
@@ -570,8 +768,8 @@ def _migrate_locked(connection: Any, stamp: datetime, dialect: str) -> Classific
             found = Classification.BASELINE
         elif tables:
             raise _refuse(
-                f"This database has no CTRLRun schema and is not empty: it holds "
-                f"{', '.join(sorted(tables))}. Creating CTRLRun's tables in somebody else's "
+                f"This database has no ctrlrun schema and is not empty: it holds "
+                f"{', '.join(sorted(tables))}. Creating ctrlrun's tables in somebody else's "
                 "database is not a recovery.",
                 (),
             )
@@ -591,7 +789,7 @@ def _migrate_locked(connection: Any, stamp: datetime, dialect: str) -> Classific
         missing = tuple(item for item in known if item not in applied)
         reasons = {
             Classification.BACKWARD: (
-                "This database was written by a newer build of CTRLRun and records a migration "
+                "This database was written by a newer build of ctrlrun and records a migration "
                 "this one does not know."
             ),
             Classification.DIVERGENT: (

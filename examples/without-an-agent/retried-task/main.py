@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """No model, no agent, no prompt: a task queue with automatic retry, charging twice.
 
 This is the same failure as `examples/double-refund/`, written the way it actually reaches
@@ -9,7 +11,7 @@ willingly when the exception means *I do not know what happened* as when it mean
 happened*.
 
 The provider commits the charge and then the reply is lost. The queue does what it is
-configured to do. CTRLRun records the outcome as AMBIGUOUS rather than failed, and the second
+configured to do. ctrlrun records the outcome as AMBIGUOUS rather than failed, and the second
 attempt is refused before it reaches the provider.
 
     python examples/without-an-agent/retried-task/main.py

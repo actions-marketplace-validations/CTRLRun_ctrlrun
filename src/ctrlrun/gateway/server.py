@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """The gateway's HTTP server. Build-list item 6c; SPEC-v0.2 §6.1, §6.3, §6.5-§6.8, §6.10.
 
 An MCP client points here instead of at the tool server. `tools/call` becomes an Action -
@@ -19,7 +21,7 @@ import select
 import socket
 import threading
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -48,7 +50,7 @@ from ..identity import (
     IdentityProvider,
     StaticIdentityProvider,
 )
-from ..policy import OBSERVE
+from ..policy import OBSERVE, UPSTREAM_MISMATCH, UPSTREAM_UNVERIFIED, Policy
 from ..receipt import Receipt
 from .mcp import (
     ACCEPTED_REVISIONS,
@@ -59,11 +61,14 @@ from .mcp import (
     parse_request,
 )
 from .outcome import (
+    AMBIGUOUS_CODE,
+    AMBIGUOUS_TOKEN,
     GatewayOutcome,
     Observed,
+    Transport,
     classify,
 )
-from .transport import STREAM, forwarded_headers
+from .transport import _CAUSE, STREAM, forwarded_headers
 from .wire import (
     _dump,
     _header,
@@ -118,8 +123,17 @@ UPSTREAM_AMBIGUOUS: Final = (-41010, "ctrlrun.upstream_ambiguous", 502)
 #: different message to a client and, in a multi-tenant deployment, a different alert.
 UNAUTHORIZED: Final = (-41012, "ctrlrun.unauthorized", 403)
 
+#: SPEC-v0.10 §4.5. `-41016` and **not** `-41013`: `SPEC-mcp-operator.md` §9.3 adds `-41013`
+#: `ctrlrun.not_a_human`, `-41014` and `-41015` to `v0.2 §6.10`'s table, and there is one
+#: namespace. `-41001` to `-41015` are allocated; this is the first free one.
+#:
+#: A distinct code earns its keep on `v0.3 §8.4`'s test: `-41001` means this action is not
+#: permitted to anyone, `-41012` means not to **you**, and this means not against **that
+#: server**, which a client answers differently from either.
+UPSTREAM_UNPINNED: Final = (-41016, "ctrlrun.upstream_unpinned", 403)
+
 #: §6.8 — the `_meta` key every intercepted response carries, so a client is not left
-#: guessing what CTRLRun recorded. `com.ctrlrun/` is a legal prefix under the revision's
+#: guessing what ctrlrun recorded. `com.ctrlrun/` is a legal prefix under the revision's
 #: key-naming rules, and `_meta` on a result is not validated against a tool's outputSchema.
 RECEIPT_META_KEY: Final = "com.ctrlrun/receipt"
 
@@ -396,7 +410,7 @@ class Gateway:
             _LOG.warning("refused a request: %s", parsed.message)
             return self._refusal(parsed, _request_id(body))
         if not parsed.intercept:
-            # §6.3 — every other method is relayed, and has no CTRLRun outcome at all. No
+            # §6.3 — every other method is relayed, and has no ctrlrun outcome at all. No
             # Action, no policy, no reservation, no receipt. `tools/list` is not an action.
             return self._relay(parsed, headers)
         return self._intercept(parsed, headers)
@@ -418,7 +432,36 @@ class Gateway:
         if payload is None:
             _LOG.warning("relaying %s failed: %s", parsed.method, observed)
             return _Response(502)
+        self._observe_tools(parsed, payload)
         return _Response(status, payload, response_headers)
+
+    def _observe_tools(self, parsed: ParsedRequest, payload: bytes) -> None:
+        """Record what the upstream advertises, from the `tools/list` it just relayed.
+
+        SPEC-v0.10 §4.2: the tool-schema pin is over the **whole** advertised entry, name,
+        description and input schema together, because a description that changed is a tool whose
+        behaviour an operator has not reviewed. §4.3's check 2 compares against what this process
+        observed, and this is the only place the gateway sees it: `tools/list` is relayed rather
+        than intercepted (`v0.2 §6.3` -- it is not an action), so the observation rides the relay.
+
+        **Best effort, and never a refusal.** A malformed or absent `tools` array leaves the
+        register untouched, which leaves a pinned action `upstream_unverified`: the fail-closed
+        direction, and the same answer as never having called `tools/list` at all.
+        """
+        if parsed.method != "tools/list":
+            return
+        from ..upstream import observe_tool_schema
+
+        try:
+            document = json.loads(payload)
+            tools = document.get("result", {}).get("tools", [])
+        except (ValueError, AttributeError):
+            return
+        if not isinstance(tools, list):
+            return
+        for entry in tools:
+            if isinstance(entry, Mapping) and isinstance(entry.get("name"), str):
+                observe_tool_schema(self._config.upstream, entry["name"], entry)
 
     def relay_method(self, method: str, body: bytes, headers: Mapping[str, str]) -> _Response:
         """Relay GET/DELETE transport operations without inventing an action."""
@@ -584,6 +627,7 @@ class Gateway:
         held: dict[str, Any] = {"request_id": request_id}
         presented = parsed.document.get("params", {})
         presented = presented.get("requestState") if isinstance(presented, Mapping) else None
+        continuation = isinstance(presented, str) and bool(presented)
 
         def executor() -> Any:
             # §6.7 — the request the gateway sends is built from the action's *canonical*
@@ -594,10 +638,28 @@ class Gateway:
             params = dict(forwarded.get("params", {}))
             params["arguments"] = action.canonical_arguments
             forwarded["params"] = params
+            # Cleared first, so a cause left in this context by an earlier call can never be
+            # chained to this one's `NotExecuted`: a custom forwarder never sets it.
+            _CAUSE.set(None)
             observed, payload, status, response_headers = self._forward(
                 json.dumps(forwarded, separators=(",", ":")).encode(), headers, fresh=True
             )
+            cause = _CAUSE.get() if isinstance(observed, Transport) else None
             outcome = classify(observed, not_executed_on_error=options.not_executed_on_error)
+            if continuation and outcome.effect is EffectState.FAILED:
+                # SPEC-v0.7 §12.2.12 — **nothing claims `FAILED` on a continuation leg.** A
+                # continuation exists only because the upstream answered `input_required`: it has
+                # the original request and is holding the exchange. A refused connection, a
+                # pre-dispatch JSON-RPC code, or the `401` rule are then answers about *this*
+                # leg's request and say nothing about what the upstream did with the original,
+                # so the effect's state is unknown. The upstream's own response is still relayed
+                # unchanged (§6.8); only what ctrlrun records changes.
+                outcome = replace(
+                    outcome,
+                    effect=EffectState.AMBIGUOUS,
+                    code=None if outcome.relay else AMBIGUOUS_CODE,
+                    token=None if outcome.relay else AMBIGUOUS_TOKEN,
+                )
             held["payload"] = payload
             held["status"] = status
             held["headers"] = response_headers
@@ -613,12 +675,20 @@ class Gateway:
             if outcome.effect is EffectState.COMMITTED:
                 return payload
             if outcome.effect is EffectState.FAILED:
-                raise NotExecuted(str(outcome.token or observed))
+                token = str(outcome.token or observed)
+                if cause is not None:
+                    # SPEC-v0.7 §2.5: a connection never established carries the exception it
+                    # was observed from, so a gateway `failed` receipt names the same evidence a
+                    # `@protect` one does. A `FAILED` from the upstream's own answer (a
+                    # pre-dispatch code, the `401` rule) has no transport exception: its evidence
+                    # is the response, which is relayed unchanged.
+                    raise NotExecuted(f"{token}: {type(cause).__name__}: {cause}") from cause
+                raise NotExecuted(token)
             raise UpstreamAmbiguous(outcome)
 
         if isinstance(presented, str) and presented:
             return self._continue(action, executor, held, presented, request_id)
-        return self._through_control(action, executor, effect_key, held, request_id)
+        return self._through_control(action, executor, effect_key, held, request_id, parsed)
 
     def _continue(
         self,
@@ -697,15 +767,23 @@ class Gateway:
         effect_key: str | None,
         held: dict[str, Any],
         request_id: JsonRpcId,
+        parsed: ParsedRequest,
     ) -> _Response:
-        from ..control import with_approval
+        from ..control import _UnmeasurableError, with_approval
 
         approval = None
         # SPEC-v0.3 §8.3 — the **combined** decision of §4.6, not the policy axis alone.
         # `Control.evaluate` reads the store to resolve delegations and still writes nothing.
         # Left as `Policy.evaluate`, an action a grant forbids outright would still have its
         # approval flow run, and a human would be asked about a call that could never run.
-        if self._control.evaluate(action).decision.value == "approve":
+        # SPEC-v0.10 §3.1.2 — the hop and the task the caller referenced, from `params.metadata`.
+        # **`evaluate` gets the same two as `execute`**, which is §9's reason for putting `hop=` on
+        # it at all: without that a hop-selected grant is decided one way for the approval
+        # pre-check and another for the call, and a human is asked about an action the hop admits
+        # or not asked about one it refuses.
+        if self._control.evaluate(action, task=parsed.task, hop=parsed.hop).decision.value == (
+            "approve"
+        ):
             approval = self._control.store.find_granted_approval(action.action_hash)
             if approval is None and self._control.policy.mode != OBSERVE:
                 # SPEC-v0.3 §6.2 — §6.10's pre-check exists to spare a human, and it spares
@@ -720,9 +798,13 @@ class Gateway:
         try:
             if approval is not None:
                 with with_approval(approval.approval_id):
-                    receipt = self._control.execute(action, executor, effect_key)
+                    receipt = self._control.execute(
+                        action, executor, effect_key, task=parsed.task, hop=parsed.hop
+                    )
             else:
-                receipt = self._control.execute(action, executor, effect_key)
+                receipt = self._control.execute(
+                    action, executor, effect_key, task=parsed.task, hop=parsed.hop
+                )
         except AuthorityDenied as refused:
             # SPEC-v0.3 §8.4 — **before** `ActionDenied`, which it subclasses. The other order
             # makes this branch unreachable and reports every authority denial as `-41001`,
@@ -741,6 +823,36 @@ class Gateway:
                 ),
             )
         except ActionDenied as refused:
+            # SPEC-v0.10 §4.5 — the two upstream reasons get their own code, and this branch is
+            # **inside** the `ActionDenied` clause rather than above it, because they are
+            # `ActionDenied` reasons and not a new exception type. `v0.3 §8.4`'s ordering hazard
+            # does not arise: one type, discriminated on the reason it carries.
+            code, token, status = (
+                UPSTREAM_UNPINNED
+                if refused.reason in (UPSTREAM_MISMATCH, UPSTREAM_UNVERIFIED)
+                else DENIED
+            )
+            return _json(
+                status,
+                json_rpc_error(
+                    request_id,
+                    code,
+                    token,
+                    str(refused),
+                    reason=refused.reason,
+                    action_id=action.action_id,
+                ),
+            )
+        except _UnmeasurableError as refused:
+            # SPEC-v0.9 §2.3, §2.4.1. **Its own clause, because `InvalidArgument` is not an
+            # `ActionDenied`** -- and without one this raised out of the handler and the socket
+            # closed with no response, which is the failure `_continue`'s comment below calls
+            # the one thing this library exists to prevent. An independent review found it.
+            #
+            # `-41001` and not a new code: §11 freezes it as "this action is not permitted to
+            # anyone in this configuration", and an action whose budgeted grant cannot measure
+            # it is exactly that. The kernel has already written the event and the receipt.
+            _LOG.warning("refused %s: %s", action.name, refused)
             code, token, status = DENIED
             return _json(
                 status,
@@ -901,13 +1013,27 @@ class Gateway:
         )
 
     def _awaiting(self, action: Action, pending: ApprovalRequired, request_id: Any) -> _Response:
-        """§6.10 — "no" is an answer, and re-asking is not free."""
+        """§6.10 — "no" is an answer, and re-asking is not free.
+
+        **The message is written here rather than taken from the exception.** `ApprovalRequired`
+        carries the decorator's wording, *"run `ctrlrun approve …`, then retry inside
+        `ctrlrun.with_approval(…)`"*, and `with_approval` is a Python context manager. Relaying
+        that verbatim told an MCP client, which may be in any language and is often a model
+        reading the error as text, to call an API it has no access to. The correct next step on
+        this path is the one `docs/mcp/gateway-in-5-minutes.mdx` already documents: a human
+        approves and **the agent's next identical call runs**, because the approval is bound to
+        the hash of what the human saw.
+        """
         record = self._control.store.get_approval(pending.request_id)
         code, token, status = APPROVAL_REQUIRED
         data: dict[str, Any] = {"request_id": pending.request_id, "action_hash": action.action_hash}
         if record is not None:
             data["expires_at"] = record.expires_at.isoformat()
-        return _json(status, json_rpc_error(request_id, code, token, str(pending), **data))
+        message = (
+            f"{action.name} requires approval: a human runs "
+            f"'ctrlrun approve {pending.request_id}', then this same call runs"
+        )
+        return _json(status, json_rpc_error(request_id, code, token, message, **data))
 
     def _upstream_response(
         self,
@@ -1014,12 +1140,28 @@ def _request_id(body: bytes) -> JsonRpcId:
 # --- the transport ----------------------------------------------------------------------
 
 
-def httpx_forwarder(config: GatewayConfig) -> Any:
-    """Forward HTTP and SSE, using a fresh connection for every intercepted action."""
+def httpx_forwarder(config: GatewayConfig, policy: Policy | None = None) -> Any:
+    """Forward HTTP and SSE, using a fresh connection for every intercepted action.
+
+    **SPEC-v0.10 §4.3's check 3**, where `policy` is given and any entry pins a certificate file:
+    every pinned certificate becomes a trust anchor for this gateway's one outbound connection,
+    so a swapped server fails the handshake **before the first request byte**. That is the only
+    one of §4.3's three checks that prevents rather than attributing, and it needs nothing new to
+    make `v0.7 §2.3`'s `NotExecuted` claim true of it.
+
+    An entry pinning by digest alone contributes nothing here and gets checks 1 and 2 only, which
+    §4.2 states as a limit rather than leaving to be discovered.
+    """
+    from ..upstream import pinned_context
     from . import http_client
     from .transport import HTTPForwarder
 
-    return HTTPForwarder(config.upstream, config.upstream_timeout, http_client())
+    pinned: set[str] = set()
+    if policy is not None:
+        for name in policy.actions:
+            pinned.update(policy.upstream_pin(name).certs)
+    verify = pinned_context(tuple(sorted(pinned))) if pinned else None
+    return HTTPForwarder(config.upstream, config.upstream_timeout, http_client(), verify)
 
 
 # --- the listening side (stdlib, per §6.11) ---------------------------------------------

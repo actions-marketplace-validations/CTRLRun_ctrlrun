@@ -7,6 +7,1600 @@ All notable changes to this project are documented here. The format follows
 Public API names are frozen in `docs/SPEC-v0.1.md` §8. Before 1.0 they may still change, and
 any change to one appears here.
 
+## [Unreleased]
+
+### Added
+
+- **`ctrlrun mcp-operator --stdio`: the operator console for the client that launched it.**
+  Desktop assistants, Cursor and the editors launch an MCP server as a subprocess and speak to it on
+  stdin and stdout; until now this server spoke only HTTP on loopback, so the registry listing
+  that went live at 0.12.2 described a server none of those clients could start. `--stdio` opens
+  no socket at all, which is stricter than the loopback rule and not a loosening of it, and every
+  message still goes through the same parser, the same refusals and the same store calls as a
+  POST body does. The approver is the account the process runs as, read from the **real uid**
+  and from nothing the client sends or sets: not `getpass.getuser()`, which believes the
+  environment, not `clientInfo`, not `SUDO_USER`. What that does and does not promise is stated
+  rather than implied: a client that can subvert the process can already open the store as that
+  account, so nothing is added to what it can do, only a name on what it did. Root is an account
+  and not a person, so under uid 0 every write is refused and reads still answer. The login
+  carries no roles and no expiry, and says so: a control naming an `approver_role` refuses over
+  stdio, and the client process holds approve, deny and resolve under the login for as long as it
+  runs, which the `initialize` instructions and the startup block both say, because the
+  confirmation the client shows before a write is then the only human step. Every flag that
+  names a header is refused with it, by name, and `--max-body-bytes` now has a floor on both
+  transports. `SPEC-mcp-operator.md` §2.3 and §3.1 carry the
+  design, and §10's exclusion of stdio is struck through with the reasoning that replaced it
+  rather than deleted. The registry manifest now describes this: `uvx ctrlrun mcp-operator
+  --stdio` with `CTRLRUN_CONFIG` pointing at your policy, which is a config block a desktop
+  client can install.
+
+## [0.12.2] — the operator's tool descriptions, and the marker the registry reads
+
+A patch release with no change to the enforcement path. Two things sat on `main` with no way for
+anyone to install them: the operator's tool and argument descriptions, which are what an MCP
+client puts in front of a model, and the `mcp-name:` marker the official MCP registry reads out
+of this package's long description to verify the namespace. The second one can only work from a
+published release, because the description it reads is the README of a distribution on PyPI.
+
+### Changed
+
+- **Every operator tool argument now describes itself, and the read tools say which to reach
+  for.** An input schema could say `control` was a string; it could not say that it filters
+  rather than selects, that `since` takes `24h` as readily as a timestamp, or that a `failed`
+  resolution is what unblocks a retry. `list_pending_approvals` now says it is where the request
+  ids come from, and `limit` says it bounds the response and not the scan, so a store holding
+  many answered requests still walks them. A caller that has to infer any of this from an
+  argument's name is guessing, and this server exists so that nobody guesses.
+
+### Added
+
+- **`server.json`, the manifest for the official MCP registry**, naming
+  `io.github.CTRLRun/ctrlrun-mcp-operator` and the PyPI distribution that carries it, with the
+  matching `mcp-name:` marker in the README. The namespace carries the owning organisation's own
+  case because the registry matches it case-sensitively against the OIDC token's
+  `repository_owner`, and the two are pinned to each other, and both versions to
+  `pyproject.toml`, by tests.
+- **The registry listing publishes itself on a kernel tag.** A job in `publish.yml` that runs
+  after the PyPI upload, authenticates with a GitHub OIDC token rather than a stored credential,
+  installs the publisher binary pinned by version and checksum, and leaves alone a version the
+  registry already has.
+- **`glama.json`**, naming the maintainer of the Glama listing.
+
+### Fixed
+
+- **The README's MCP row pointed an approver at the server and not at their own page.** It now
+  links the page written for the person answering the request.
+
+
+## [0.12.1] — the verify fixes 0.12.0 was tagged just before
+
+`0.12.0` was tagged at the release merge, and these three landed on `main` shortly after, so the
+published wheel carried none of them. Nothing here touches the enforcement path: the whole of it
+is `verify/scenarios.py`, the self-check tool. It under-reported rather than over-claimed, which
+is the safe direction, but the under-report was severe enough to read as a tool that checks
+nothing. On the document below, `0.12.0` grades **1 of 1** and calls thirty-one not applicable;
+this release grades **22 of 22**.
+
+### Fixed
+
+- **`ctrlrun verify` sized every vector for eighteen spends, and a grant with an ordinary
+  count budget graded nothing.** `select` fitted each candidate to the grant's budgets with
+  `PROCESSES * 2 + 2` of room, G4's nine landings doubled, for every guarantee. A document whose
+  grant said twelve refunds an hour, which is what a payments pack writes for a support agent,
+  reported twenty-three guarantees not applicable, "every action reaching this decision exceeds
+  a budget on the grant that covers it", about a budget that admitted the action twelve times.
+  The room is now the scenario's own: `DEFAULT_SPENDS`, four, unless the scenario says
+  otherwise, and G4 says `PROCESSES + 2`.
+- **The synthesizer stopped at the first rule of a decision.** A grant's budget can refuse the
+  first rule's vector for a reason the second rule's does not share: a document whose first
+  `approve` rule is `counterparty_new_eq: true` yields a vector with no `amount`, which a budget
+  on `amount` cannot measure, while the next `approve` rule is the amount band the budget was
+  written for. `select` now tries every candidate of a decision, rule by rule, before it
+  concludes nothing binds.
+- **A boolean condition was negated with a string.** `X_neq` on `counterparty_new_eq: true`
+  produced `"ctrlrun-verify"`, neither answer; the vector landed in the next rule by accident of
+  `eq` and carried a value no document could mean. A boolean is negated with the other boolean.
+- **`adopt-site/` was a committed build cache.** Two files, `.vite/deps/package.json` and an
+  empty `_metadata.json`, swept into the repository root by #138 and referenced by nothing for
+  four milestones. Removed, and `.vite/` and `node_modules/` are in `.gitignore` so it cannot
+  recur. It shipped in no distribution; this is the repository root a reader lands on.
+
+
+## [0.12.0] — Hardening
+
+One question: **is the thing this project says about itself checkable?**
+
+No new capability. Three claims that were prose became tests, and each of the three was false or
+incomplete when the test was written, which is the milestone's whole argument.
+
+### Changed
+
+- **The module map is acyclic, and `ARCHITECTURE.md` §6's rule is now a test.** §6 has said
+  *dependencies point downward only* since v0.1, and from v0.7 it was false: a review found
+  `state -> receipt -> policy -> authority -> state` and the sentence was amended to record the
+  cycle rather than fix it. Nothing broke at run time, because the two edges out of `policy.py`
+  are function-level, so `import ctrlrun` resolved in one order and the suite passed for five
+  milestones.
+
+  Broken in two places. `Decision` and `POLICY_UNAPPROVED` moved to **`ctrlrun.decision`**, which
+  imports nothing from the package: that was the whole of what a receipt needed from the decider,
+  and an evidence type reaching **up** into it is the edge that most contradicts §6's table. Then
+  the policy **document grammar** -- schemas, the strict YAML loader, the condition parser and
+  evaluator, type-strict equality -- moved to **`ctrlrun.grammar`**, so `authority.py` no longer
+  imports `policy.py` at all. `SPEC-v0.3.md` §4.5 requires the two axes to share **one** condition
+  evaluator, and that is better served than before: the one evaluator is owned by neither axis.
+
+  **No public name moved.** `policy.py` re-exports all thirty-four, so
+  `from ctrlrun.policy import Decision, Condition, parse_conditions` resolves to the same objects
+  and `SPEC-v0.1.md` §8's frozen `__init__` block is unchanged.
+
+  `tests/test_module_graph.py` walks every module's AST and separates two questions §6 kept
+  conflating: the **import-order** graph, which is module-level imports, and the **layering**
+  graph, which counts deferred imports and is what the table describes. The recorded cycle is
+  invisible to the first, so a guard built only on module-level imports **passes on 0.11.0's
+  tree**. Writing it found a second cycle nobody had recorded, `jwt_identity` and `revocation`
+  sharing a security-critical redirect handler through a deferred import; `_NoRedirects` moved
+  down to `revocation.py` and keeps logging under `ctrlrun.policy`'s logger name so no operator's
+  handler is re-routed.
+
+- **The gateway told MCP clients to call a Python API.** A `-41002` relayed
+  `str(ApprovalRequired)` verbatim, and that exception carries the decorator's wording: *"run
+  `ctrlrun approve …`, then retry inside `ctrlrun.with_approval(…)`"*. On the one path where the
+  caller may be in any language, and is often a model reading the error as text, it pointed at a
+  context manager the caller cannot reach. It now says what the gateway's own documentation
+  already said: a human approves and **this same call runs**.
+
+### Added
+
+- **Property tests over generated inputs** (`tests/test_properties.py`, `hypothesis`). The
+  invariant that matters is the one v0.11 item 1 violated: **every break a tamper reports names a
+  row the store actually holds.** That defect reported `content_altered 99` and `missing 100` on
+  an eight-row chain, because position came from the document rather than the `seq` column.
+  Reinstating it fails these tests immediately.
+
+  The first version of that property was *one tamper is one break*, and hypothesis falsified it on
+  its second example: altering row `n` also breaks the link at `n + 1`. Two is correct and the
+  expectation was wrong, which is the same mistake the file exists to catch. `derandomize=True`,
+  so a counterexample found in CI reproduces locally by construction.
+
+- **A CycloneDX SBOM of the wheel, measured from the wheel** (`scripts/sbom.sh`). Generated by
+  installing the built wheel into an empty environment and recording what resolves, not by reading
+  `pyproject.toml`: a manifest-derived SBOM is the project's opinion of its own dependencies. The
+  answer is two, `PyYAML` and `click`. CI generates and checks it on every pull request, and
+  `release.yml` writes it into `dist/` **before** the attestation step, so it is signed with the
+  distributions and attached to the release.
+
+  The seed packages are removed before the scan, and that is not cosmetic: `python -m venv` adds
+  pip, and on 3.11 setuptools too, and a scanner cannot tell *"ctrlrun needs this"* from *"the venv
+  came with this"*. The first version removed only pip, passed on 3.12 and went red in CI on 3.11
+  with `['PyYAML', 'click', 'setuptools']`. The assertion compares by **equality**, which is why it
+  caught a document that would have overstated what a consumer takes on.
+
+### Fixed
+
+- **A shared-directory race in the cookbook tests.** Two tests ran the same recipe in
+  `examples/cookbook/<name>/` on different xdist workers; one's `rm -f verify-report.json` landed
+  between the other's write and read, and `bash -euo pipefail` turned it into a failure with
+  nothing wrong in the library. Measured at four concurrent runs: shared directory 2 of 4 fail,
+  one copy per run 4 of 4 pass. Each test now runs in its own copy, and the suite stops writing
+  into the working tree.
+
+- **Both adapter READMEs failed on copy-paste.** Their examples show `identity=...` as an
+  ellipsis, and dropping it leaves the first call refused with `no principal is available`. Both
+  now state the requirement and say why it is fail-closed.
+
+- **`adapters/PUBLISHED.toml` had gone stale in the other direction.** 0.11.0 published both
+  adapters at 1.2.0 with `<0.12` and never updated the record, so the file spent a release
+  claiming 1.1.0 / `<0.11`. Both adapters go to **1.3.0** with `ctrlrun>=0.5,<0.13`, because the
+  published 1.2.0 excludes this kernel, and `RECORDED` now freezes 1.2.0's range too.
+
+## [0.11.0] — Evidence
+
+One question: **can the record be trusted after the fact, and kept?**
+
+Every milestone so far added something the receipt records. None asked whether the receipt is
+still worth reading a year later, on a database an administrator can write to, after somebody
+pruned it. This is the first milestone whose subject is the evidence itself rather than the
+decision, and the first that opens by admitting a defect in the thing it is about: the chain has
+never detected truncation or append, both reachable in two SQL statements, and both written down
+since `SPEC-v0.6.md` §6.4.
+
+### Added
+
+- **`docs/SPEC-v0.11.md`, the v0.11 "Evidence" contract.** Documentation only; the version bump is
+  the release item's. It answers one question, can the record be trusted after the fact and kept,
+  and it opens by demonstrating the defect it exists to close: a truncation and a forged append both
+  verify as intact after two SQL statements, because the head that would catch them is a row in the
+  same database. Transcribed from a real store rather than argued.
+
+- **A reader that names a bad row and blinds nothing else** (`SPEC-v0.11.md` §5, rule 3). A single
+  malformed *value* of a declared key raised out of `Receipt.from_dict`, and because both stores
+  build every row before any caller sees one, that one `UPDATE` stopped `ctrlrun receipts`,
+  `receipts --verify-chain`, `ctrlrun inspect`, `ctrlrun stats` and the operator MCP server's
+  `receipts` and `stats` tools together. `inspect` on an action the tamper never touched is what
+  the blast radius really was: not "this receipt is unreadable" but "this store is unreadable".
+  `SPEC-v0.7.md` §12.5 recorded it and deferred it twice.
+
+  **One tampered row now costs one row.** `ctrlrun.receipt.UnreadableReceipt` is what a store hands
+  back for a row it cannot construct, carrying the row's `seq`, its `receipt_id` where that field
+  alone is readable, and the **type** of what refused it, never the message. `CHAIN_BREAKS` did not
+  change: §12.5 offered a new break name as one of two candidates and `SPEC-v0.11.md` §5.1 declines
+  it, because `content_altered` already names a document that cannot be canonicalized and a second
+  name for one fact would be two names for one break.
+
+- **A row that does not parse is one row too.** The first implementation of the reader above
+  called `json.loads` in the generator expression that fed it, **outside** the guard, so a row
+  whose stored `json` is not JSON at all raised through every reader exactly as before v0.11, and
+  worse: `JSONDecodeError` is not a `CTRLRunError`, so the CLI's handler did not catch it either
+  and `ctrlrun receipts` printed a traceback. One `UPDATE receipts SET json = 'not json'` was
+  enough. Parsing now happens inside the refusal's own guard, and a row that parses to something
+  that is not an object (`3`, `"a receipt"`, `[1,2,3]`, `null`) is refused as one row rather than
+  trusted. Found by review; the tests that missed it all tampered with a row's *content*, and
+  `{}` and a float among the controls are both valid JSON.
+
+- **Enforcement coverage: what this deployment has never exercised** (`SPEC-v0.11.md` §7).
+  `ctrlrun scan --coverage` reads a store and reports the policy entries, gateway tools and
+  `@protect` actions that no receipt in it names.
+
+  **From what is already written**: no new event type and no new column. The action name lives on
+  the receipt rather than on the event, and every action that reached a decision leaves one, a
+  **denial included** — so an action that is always denied counts as exercised, because the deny
+  rule firing is the action being enforced rather than ignored.
+
+  **It is a list and not a score.** No percentage, no ratio, no badge, and it does not move the
+  exit code: a number that ranked a deployment would be `verify` grading an operator's document
+  in a new costume, which `SPEC-v0.4.md` §3.9 forbids. Every entry carries a reason that states
+  what was not found, and the report says in every rendering, empty or not, that **a policy entry
+  nothing exercised may be correctly unused** — a quarterly job, a deny rule that exists so the
+  action is refused rather than unknown, a tool nobody has needed yet.
+
+- **Retention: a prune that leaves the chain verifiable across the gap, a checkpoint, and a
+  hold** (`SPEC-v0.11.md` §4 and rule 2). There has been no retention policy until now, and
+  `../ctrlrun-docs/docs/postgres.md` said so in the same breath as the reason one is hard:
+  deleting receipts from the middle or the end of the chain is detected as a break **by design**.
+
+  A prune removes a **prefix**, never a suffix and never a middle, and leaves a **checkpoint**
+  the chain reader seeds from. `ctrlrun prune --through --older-than --provider --by --reason`.
+
+  **It refuses rather than warns**, and there is no `--force`, no `--allow-gap` and no setting
+  that admits a break the prune caused. Refused: a prune that would leave a `(kind, seq)` pair
+  the store did not already report; one through the chain's head; one moving the checkpoint
+  backwards; one overlapping a held range; and one that would delete a ledger row whose charge
+  is still held, or a `COMMITTED` row inside `SPEC-v0.9.md` §7.3's window, because pruning that
+  hands back authority nobody granted.
+
+  **Rule 2 is a delta, not "the chain verifies afterwards."** `unchained` is a pre-existing
+  condition on any store migrated from v0.1 to v0.5 and can never be inside a prefix, so the
+  absolute version would make retention permanently impossible on the oldest and largest stores,
+  which are the ones it is for.
+
+  **The prune anchors its checkpoint before it deletes anything.** An attacker who erases a
+  prefix and writes a checkpoint to explain it must also anchor it, through the provider, which
+  is outside the store, so a prune stays visible in the anchor history even though the receipts
+  are gone. An anchor at or below an anchored checkpoint is then **superseded**, not broken:
+  without that, every anchor older than the retention window would be permanently
+  `anchor_broken` and an anchoring deployment would have to choose between pruning and a
+  permanent tamper signal.
+
+  **"Anchored" means the provider says so, at the pair the checkpoint claims.** The first
+  implementation took the union of what the provider returned and what the store's own `anchors`
+  table held, so one `INSERT` beside a forged checkpoint row bought supersession and the row's
+  hash was never compared to anything. Supersession now comes from `provider.since()` alone, and
+  the anchor's `(seq, hash)` must be the pair the checkpoint asserts. A local row the provider
+  does not confirm buys nothing. Found by the independent review the build order required for
+  this item, which also gave `SPEC-v0.11.md` §4.6 the sentence that says which reading is meant.
+
+  **A prune leaves two receipts, and they are distinguishable.** The first records the request,
+  `--through`, `--older-than` and `--reason`, staged `proposed`; the second records what became
+  of it, `completed` or `refused`. They were byte-identical at first, and `--older-than` was in
+  neither, which made the record of a refusal worth nothing.
+
+  **The bound comes from the receipts, not from `receipt_chain`.** That row is the one
+  `SPEC-v0.11.md` §2.1 assumes an attacker rewrites, and deciding `--through` from it meant one
+  `UPDATE` turned a prefix prune into a full-chain delete that both readers called clean.
+
+  **The prune's lock is held across the validation and the delete on both backends.** SQLite's
+  `pruning()` opened `BEGIN IMMEDIATE` and then every `put_anchor` went through `with connection:`
+  and committed it, so the prune held the lock for one statement; a failed prune could leave
+  `missing` and `link_broken` on a chain that was intact when it started. The defect had been
+  found on Postgres during the item and fixed only there, and SQLite is the default backend.
+
+  **A checkpoint is a row, not a receipt field.** A receipt naming itself a checkpoint is a
+  string in a document, and `SPEC-v0.3.md` §4.3.1 settled that shape. A prune writes a receipt
+  for a human; the row is what the walk reads.
+
+- **`ctrlrun hold place` / `release` / `list`.** A hold names a range and refuses to prune it.
+  **No expiry**: a hold that lapsed on a timer would release evidence on a schedule nobody
+  reviewed, which is `SPEC-v0.9.md` §4's rule about a budget hold applied unchanged.
+- **`G29`, `G30` and `G32`.** `G32` grades the *interaction*: an honestly pruned chain leaves a
+  clean anchor report. `G28` grades a truncation against an anchor and `G29` grades a prune
+  against the chain, and the pair was graded by neither.
+
+- **An anchor: the chain's head, recorded where the store's writer cannot reach it**
+  (`SPEC-v0.11.md` §2, §3). The receipt chain detects alteration. It does not detect
+  **truncation**, because the head that would catch it is a row in the same database. Measured on
+  a six-receipt chain, in two statements:
+
+  ```
+  DELETE FROM receipts WHERE seq > 3
+  UPDATE receipt_chain SET seq = ?, hash = ?
+  -> ok=True verified=3 breaks=[]
+  ```
+
+  Three receipts erased, and the chain reports itself intact. An anchor records the pair the head
+  holds outside the database, at an interval the operator chooses, and the same two statements are
+  then named `anchor_broken` at the anchored `seq`.
+
+  **What an anchor proves, and what it does not.** It freezes a **prefix**: anything at or below
+  an anchored `seq` can no longer be removed or altered without the anchored pair failing to
+  reproduce. **An append is not detected**, because it lands above every anchored `seq`; nor are
+  receipts created and destroyed between two anchors; nor who wrote any of it. The window you are
+  exposed to is `(last anchored seq, current head]`, and its size is your choice of interval.
+  That is the number to quote rather than any sentence about tamper-evidence, and there is a test
+  that runs a forged append and requires both reports to stay clean.
+
+  **No keys.** The anchor consumes a timestamp and issues nothing: no key generation, no rotation,
+  no revocation, no signing. Signing stays off the roadmap for the reason `SPEC-v0.6.md` §11
+  gives, and a test greps this module's own source to keep that true.
+
+- `ctrlrun.anchor`: `AnchorProvider` (a four-call protocol you implement, because ctrlrun ships no
+  timestamp client and a network client does not belong in this wheel), `verify_anchors`,
+  `AnchorReport`, `ANCHOR_BREAKS`, and `anchor=` on `Control`.
+- **`ANCHOR_BREAKS` is its own closed set and `CHAIN_BREAKS` does not change.** `anchor_broken`,
+  `anchor_missing`, `anchor_repudiated`. Putting them in `CHAIN_BREAKS` would fail `G11`'s control
+  with `control failed` on every anchoring deployment, because that control reads the whole
+  `ChainReport`. `anchor_unavailable` is in neither set: an unreachable provider is a transport
+  failure, and grading it as tampering would make a network blip indistinguishable from a
+  truncation.
+- **`ctrlrun anchor`**, with `--verify`, and migration **`0008_anchor_checkpoint_hold`**.
+- **`G28`, a truncation past an anchor fails**, whose positive control is the attack itself run
+  against a real store.
+
+- **One chain, five receipt schema versions, walked end to end** (`SPEC-v0.11.md` §6). A store
+  kept since v0.6 holds five: `v3` (0.6), `v4` (0.7), `v5` (0.8), `v6` (0.9), `v7` (0.10).
+  **No new field**: `schema` has existed since `SPEC-v0.3.md` §12.2. What is new is the proof
+  that `verify_chain` walks such a chain hash by hash, **each row hashed by the rule its own
+  version wrote**. v0.10's release pass proved the `v6`/`v7` boundary against the released 0.9.0
+  and stopped there.
+
+  `scripts/five_schema_chain.py` builds the chain from the **released wheels** rather than from
+  fixtures: five environments, `pip install ctrlrun==0.6.1`, `0.7.0`, `0.8.0`, `0.9.0`, `0.10.0`,
+  one store, then this build verifies across the whole thing. A fixture is this build's opinion
+  of what 0.6 wrote; the wheel is what it wrote.
+
+  And a receipt whose schema label this binary does **not** know is named, not reported as a
+  break: `SPEC-v0.6.md` §3.2's distinction, and the difference between *this evidence is from a
+  future version* and *this evidence is tampered with*. Relabelling a stored row without
+  rehashing it is still `content_altered`, because that is somebody editing evidence.
+
+- **`G31`, five receipt schemas verify**, and `ctrlrun.guarantees/v6` becomes **`v7`**, moved
+  once. `G28` to `G30` and `G32` are not in the catalogue yet: `SPEC-v0.11.md` §8 assigns ids in
+  item order so that splitting the milestone renumbers nothing, and a row whose check does not
+  exist would report something before it could.
+
+### Changed
+
+- **`StateStore.receipts()` returns `tuple[Receipt | UnreadableReceipt, ...]`**, amending
+  `SPEC-v0.6.md` §9.2's frozen protocol. Before, it raised. Both backends change, and a second
+  backend could not implement §5 without it. A store with no bad row is unaffected: every row still
+  reads back as a `Receipt`.
+- **A receipt's position now comes from the `seq` column**, which is what `verify_chain`'s docstring
+  has claimed since v0.6 and what was not true as shipped. Both stores selected `json, hash` and
+  ordered by a column they never read, so every `Receipt.seq` came out of `document.get("seq")`, the
+  one field a tamperer controls. Rewriting one document's `seq` from 2 to 99 reported `missing 2`,
+  `content_altered 99`, `missing 100` and `link_broken 3`: four breaks at three positions, two of
+  them rows that do not exist. The same tamper now reports `content_altered` once, at 2.
+- `ctrlrun stats` reports `unreadable receipts` and the `ctrlrun.stats/v1` document carries
+  `unreadable_receipts`, **omitted entirely where there is none**, on `ledger_rows`' precedent. A
+  total that silently dropped a row nobody could read would be `SPEC-v0.4.md` §3.8's false green.
+
+## [0.10.0] — Multi-agent
+
+One question: when one agent hands work to another, what does the second one hold?
+
+### Added
+
+- **A hop: authority that crosses an agent boundary.** A hop is `SPEC-v0.3.md` §5's delegation over
+  a boundary the kernel does not control, and almost nothing about it is new machinery. The same
+  `contained_dimension` decides it, over all eight dimensions, at creation and again at every
+  evaluation. The same `delegation_id` names it. `SPEC-v0.9.md` §2.7's walk charges it, so a
+  consumption under a hop costs the **issuer** and every ancestor to the root.
+
+  **One rule is new, and it is the whole of what v0.10 adds: an action proposed under a hop is
+  evaluated against that hop's grant alone, with no fallback.** Before it, `Authority.evaluate`
+  passed on any matching grant, so a receiving agent holding a grant of its own was authorised by
+  that one, the hop was never consulted, and the issuer's budget paid nothing. Which way it went
+  turned on how two identifiers sorted.
+
+- `Control.hop(parent_id, grant, *, by, action_id=None)`, `hop=` on `@protect`, `Control.execute`
+  and `Control.evaluate`, and `hop` in the metadata the gateway and the ACS hook already carry.
+- **`ctrlrun.receipt/v7`** adds `hop`: the hop an action ran **under**, never the one it created.
+- **`ctrlrun.policy/v8`** adds `upstream:` on an action entry, pinning the server an action
+  authorises itself against by certificate or by the hash of its advertised tool schema.
+- **`ctrlrun.guarantees/v6`**: G25 `a hop narrows or it is refused`, G26 `a hop is named on both
+  sides`, G27 `a swapped upstream is denied`.
+- `ctrlrun inspect --hop` emits `ctrlrun.hop/v1`: who issued a hop, and **which dimensions each
+  link narrowed**, which is the question an operator paged at 3am actually has.
+- `ctrlrun scan` names the principals holding a grant no hop bounds. It reports and does not score.
+- **`task=` and `hop=` on `ctrlrun.adapter.needs_approval`**, the pre-invocation predicate a
+  framework asks before it invokes a tool. Without them the predicate evaluated against the
+  receiver's whole candidate set while `execute` evaluates against the hop **alone**, so it answered
+  "a human is needed" for a call `execute` then refuses: the framework surfaced an approval item, a
+  human said yes, and the call failed anyway. Never a wider grant, because `Control.execute` is the
+  enforcement point and refuses either way; what it cost was the framework's own approval item and a
+  receipt nobody could explain. `SPEC-v0.10.md` §9 froze the name and §9.4 records that it shipped
+  after this section was first written, which is why it is here and not above.
+
+### Changed
+
+Every behaviour below is **stricter** than 0.9.0, with what it did before.
+
+- **An action presented with a hop is decided against that hop alone.** Before: every grant the
+  principal held was a candidate and the narrowest-sorting one decided. An action presented with
+  **no** hop is decided exactly as 0.9.0 decided it, which is why every existing deployment
+  upgrades untouched.
+- **A resumed leg is evaluated on the task and the hop.** Before (`v0.9 §6.3.2`), the task
+  dimension was not evaluated on a resumed leg at all, because the rehydrated action carried none;
+  `EXECUTION_STARTED` now carries both and `_resumed_context` reads them back. A leg suspended by
+  **0.9.0** carries neither and is evaluated exactly as 0.9.0 evaluated it, or every action in
+  flight across the upgrade would be denied.
+- **A lease extension is decided against the hop the first leg held**, on every round. Before, and
+  briefly during this milestone, a receiver holding a grant of its own kept its reservation across
+  a round trip after the hop was cut.
+- **Observe mode reports the refusal enforce mode would raise.** Before (`v0.9 §4.2.1b`), it
+  reported whichever refusal it reached first, which was not always the same one.
+- **A policy that pins an upstream refuses an action the process has not verified one for.**
+  Before, no such key existed. In-process there is no upstream to observe, so a pinned action
+  refuses on every call; the ACS hook refuses such a policy at construction.
+
+### The upgrade, and the one irreversible thing
+
+`0007_budget_ledger` is still the last migration: receipts and events are stored as whole JSON
+documents and `created_via` is already `TEXT`, so v0.10 needs no schema change.
+
+**The irreversible step is creating the first hop, not installing 0.10.0.** `CreatedVia` is a closed
+vocabulary and `Authority._candidates` reads every delegation row before filtering any of them, so a
+0.9.x binary meeting one `created_via='hop'` row answers `authority_unreadable` for **every action in
+the deployment**, not just that delegation. Fail-closed, and a deployment that stops. A deployment
+that installs 0.10.0 and creates no hop can still roll back.
+
+## [Unreleased]
+
+### Added
+
+- `docs/SPEC-v0.10.md`, the v0.10 "Multi-agent" contract: authority propagation across agent hops,
+  upstream identity pinning, and one ordered list of checks for both enforcement modes, as a delta
+  over v0.1 to v0.9. Documentation only. It answers one question: when one agent hands work to
+  another, what does the second one hold?
+
+  Almost nothing in it is a new mechanism. A hop is `SPEC-v0.3.md` §5's delegation over a boundary
+  the kernel does not control, checked by the same `contained_dimension` with a third caller,
+  identified by the `delegation_id` that already exists, and charged by `SPEC-v0.9.md` §2.7's walk
+  to the root. **One rule is new, and §2.3 is the whole of it: which grant decides.** A probe
+  against the tree at the 0.9.0 tag settled that: `Authority.evaluate` passes on any matching grant,
+  so a receiving agent holding a grant of its own is authorised by that one, the hop is never
+  consulted, and the issuer's budget is charged nothing. An action proposed under a hop is therefore
+  evaluated against that hop's grant alone, with no fallback.
+
+  Four rules the milestone is measured against. **A hop narrows or it is refused**, with no widening
+  at a boundary and no dimension inherited by omission. **The issuing agent's budget is what a hop
+  spends**, so a hop never creates a second root. **A hop is evidence, not a side channel**: both
+  sides' receipts carry the same hop id. And **nothing infers who the peer is**: the receiving
+  agent's identity is resolved by the `IdentityProvider` and never read off the payload.
+
+  The four open questions are answered in the specification rather than left to an item. ctrlrun
+  defines no wire format and consumes none; what crosses a hop is a reference of two strings. A hop
+  is a record in the store and not a claim in a token, which the budget rule forces and which costs
+  cross-store propagation, refused fail-closed and by name. Depth across hops is
+  `max_delegation_depth`, unchanged. A receipt records the hop it ran under and nothing derivable
+  from it.
+
+  It also pays `SPEC-v0.9.md` §4.2.1b's named debt, the two enforcement paths whose checks run in
+  different orders, and takes up §6.3.2's handover: the task and the hop are stamped onto
+  `EXECUTION_STARTED` so a resumed leg is evaluated on both dimensions instead of skipping them.
+
+### Fixed
+
+- **The DCO check refused every Dependabot pull request.** Dependabot signs its commits off as
+  `support@github.com` while authoring from its noreply address, so the trailer never matched
+  the author and the `dco` job was red on every update it opened, the weekly lock updates
+  included. A sign-off under another address is now accepted on exactly one fact that is not a
+  string anyone can set: GitHub's own signature on the commit, read back through the API. There
+  is still no exemption keyed on a name or an email.
+
+### Changed
+
+- **CI installs from hashed locks.** Every `pip install` in a workflow now reads a
+  `requirements/*.txt` that `scripts/lock.sh` writes with `uv pip compile --universal
+  --generate-hashes`, under `--require-hashes`, and then installs the checkout itself with
+  `--no-deps --no-build-isolation` against the setuptools the same lock carries; `python -m build`
+  runs with `--no-isolation` for the same reason. What a job resolves, the build backend included,
+  is what somebody generated and reviewed, not what PyPI served that morning. The version floors
+  in `pyproject.toml` are unchanged: they are what a user may install against, and the locks are
+  what CI does. Dependabot moves the locks weekly, grouped.
+- **A Scorecard gate on every pull request.** `scorecard-gate.yml` runs OpenSSF Scorecard's
+  file-based checks against the pull request's tree and fails it if any would come back below
+  what `main` publishes, so an unpinned install, a widened token or a vulnerable pin is red
+  before the merge rather than a lower badge after it. `tests/test_repository_signals.py`
+  asserts the same rule for `pip install`, so the suite catches it first.
+
+## [0.9.0] - Envelope
+
+*Undated until the tag.*
+
+Every guarantee before this one answers **whether**. A grant says `amount_lte: 5000`, and is silent
+about the thousand actions that each pass it: the authority model bounds one action and has never
+bounded an aggregate, so an agent acting entirely within its permissions can still empty an account
+one permitted refund at a time. v0.9 answers the other half: **how much, over which records, for
+which task?**
+
+Three dimensions, one rule each.
+
+**Consequence budgets.** A grant may carry `budgets:`, a metric with a limit over a rolling window,
+consumed **on reserve, inside the reservation's own transaction**, because a check on one line and a
+consumption on another is a race two processes win together. **Ambiguity is not a refund**: an
+`AMBIGUOUS` effect holds its consumption until a human or a hook resolves it, because otherwise an
+agent that can manufacture ambiguity can manufacture authority. A budget names a metric, not a
+consequence: nothing here ranks, scores or classifies an operator's actions.
+
+**Scope providers.** `scope=` answers "is this record this principal's?", strictly before the
+reservation, which is the bite on an identifier an attacker chose. A grant permits `records.read` on
+`customer:*`, and until now nothing had an opinion about whose record `customer:90210` is.
+
+**Task-bound authority.** `tasks:` narrows a grant to a unit of work, by the same `child ⊆ parent`
+rule as every other dimension. It limits blast radius; it does not detect a hijack.
+
+**What a budget is not.** It **cannot recall an action already in flight**: a rolling window changes
+what the next reserve may do and nothing about what is already reserved, so a reservation taken a
+second before the window rolls commits regardless. It counts a metric an operator named, an argument
+on the action, and is not a consequence model: nothing ranks, scores or classifies what an action
+means. It is per store, so two deployments sharing a provider account and not a store each enforce
+their own. And it is fail-closed against its own principal: an agent able to manufacture ambiguity
+can pin a budget it cannot spend, which is a denial of service against the operator's own agents and
+is the deliberate side of the trade against an agent that manufactures authority.
+
+### Added
+
+- **Task-bound authority** (SPEC-v0.9 §6). A grant may carry `tasks:`, a unit-of-work dimension
+  attenuated by the same `child ⊆ parent` rule as actions, resources and environments.
+  `Control.execute(task=...)` and `Control.evaluate(task=...)` take the resolved task id;
+  `@protect(task=...)` takes a template over the call's arguments, like `effect=` and `resource=`.
+  **G24** grades it: a task-bound grant refused off its task, by reason and not by type.
+
+  **A grant that names no `tasks:` authorises any task**, so every existing grant upgrades
+  untouched. `SPEC-v0.3.md` §5.4 settled that asymmetry in writing: a root grant's omissions are
+  an operator's decision, a delegation's are what an attacker would write.
+
+  Two paths deliberately do **not** evaluate the dimension: `Control.resume` and a lease
+  extension. Both rehydrate an action that carries no task, and evaluating it there would put
+  `AUTHORITY_DENIED` on what is the only receipt an MCP multi round-trip ever gets. A resumed leg
+  is therefore unbound by task, which is stated rather than hidden.
+
+  The task reaches the authority decision and the receipt, and **never the action hash**: a field
+  on `Action` would move every hash in existence and invalidate every stored approval.
+
+- **Consequence budgets, enforced** (SPEC-v0.9 §4). **G22.** A budgeted grant charges every
+  ancestor on reserve, inside the reservation's own transaction, and the ledger is released
+  exactly when the effect reaches `FAILED`.
+
+  **Ambiguity is not a refund.** An `AMBIGUOUS` effect keeps its consumption until a human or a
+  `reconcile` hook resolves it, because otherwise an agent that can generate ambiguity can
+  generate authority, and generating ambiguity is free for any flaky integration. This is the
+  correctness hole that kept budgets out of four milestones.
+
+  The refusal is `ActionDenied(reason="budget_exhausted")`, naming the grant, the metric and the
+  window, and **never the remaining balance**: refused actions cost nothing, so a refusal that
+  reported the balance is an oracle an attacker binary-searches.
+
+  `ctrlrun verify` reports **22/22** on the shipped examples, with G22, G23 and G24 all graded
+  against positive controls.
+
+- **The budget ledger, and one amendment to a frozen protocol** (SPEC-v0.9 §3). `StateStore` has
+  been frozen since v0.6 and gains exactly two things: `charges=` on `reserve_effect` and
+  `consume_approval_and_reserve`, and `consumptions()` to read the ledger back. Migration
+  `0007_budget_ledger`, additive and forward-only.
+
+  **The charge lands inside the transaction that writes the reservation**, on all three backends.
+  Anything else is a check-then-act race: two processes read the same remaining amount and both
+  spend. On Postgres that needs a `SELECT ... FOR UPDATE` on a per-grant anchor row before the sum,
+  because READ COMMITTED does not serialise a sum and an insert. Measured, not chosen: without it,
+  twenty-four processes racing a budget that permits ten spent **2400 against a limit of 1000**,
+  with zero refusals.
+
+  Nothing spends this yet. The consumption, the holds and the releases are the next item.
+
+- **Consequence budgets, in the document** (SPEC-v0.9 §2). A grant may carry `budgets:`, each a
+  `metric`, a `limit` and a `window`. They load, validate, render into the policy hash, and
+  attenuate down a delegation chain. **Nothing counts yet**: the ledger and the spending are
+  separate items, so this release note describes a contract and not an enforcement.
+
+  **The window axis reads backwards, and it is worth stating plainly.** Over the same limit a
+  *shorter* window is a *higher rate*: a child of 100,000 per hour under a parent of 100,000 per
+  day is 24 times the parent's authority, and is rejected. A child of 100,000 per week is one
+  seventh the rate, and is accepted. Containment is existential: for every parent budget there
+  must exist a child budget on the same metric with `limit <=` and `window >=`, so one child
+  budget may discharge several of its parent's.
+
+  A metric names an action argument, or `count`. Its value must be a **non-negative integer that
+  is not a `bool`**, so money is budgeted in minor units, as `examples/authority/payments.yaml`
+  already does for every constraint. The kernel does not know what any metric means: there is no
+  branch on a metric name anywhere.
+
+- **Scope providers** (SPEC-v0.9 §5). `Control.execute(scope=...)` and `@protect(scope=...)` take
+  a callable that answers what the calling principal's assigned scope is; **the kernel matches**
+  this action's resource into it, with the relation a grant's `resources:` already uses. It runs
+  **strictly before the reservation** and before the precondition recheck, so a provider that
+  hangs leaves nothing reserved and nothing executed. **G23** grades it.
+
+  This is the bite on an identifier an attacker chose: a grant permits `records.read` on
+  `customer:*`, and until now nothing had an opinion about *whose* record `customer:90210` is.
+
+  Two distinct refusals, never one: `scope_unavailable` when the provider raises, answers with the
+  wrong shape, or answers something the canonicalizer refuses; `out_of_scope` when it answered and
+  the resource is not covered. A non-callable `scope=` is `InvalidArgument`, at decoration time
+  under `@protect`.
+
+  Only the **hash** of what the provider returned reaches the receipt, under its own domain tag so
+  it can never equal a precondition fingerprint over the same mapping. A scope is a list of what a
+  principal may touch, and an evidence store is not the place to keep a second copy of it.
+
+  It **amends `SPEC-v0.7.md` §6.9**, which said v0.9's scope providers would configure the
+  precondition hook rather than add a second one. `SPEC-v0.9.md` §5.2.1 records the amendment and
+  the three mechanical differences that justify it.
+
+- **The operator surfaces for a budget** (SPEC-v0.9 §7). **No new command.** `ctrlrun inspect`
+  gains `--grant GRANT_ID`, which reports each of that grant's budgets as three numbers:
+  **consumed**, the un-released sum over the rolling window, which is the number that decides;
+  **held**, the part of it whose effects have not committed; and **why**, the effect holding each
+  part and the state it is in.
+
+  The third is the deliverable. A budget that refuses while it looks nowhere near its limit is
+  almost always one unresolved effect, and without the third column an operator cannot get from
+  the refusal to `ctrlrun resolve`. The view prints that command with the effect key already in
+  it, because an operator retyping the key from the line above is one transcription away from
+  resolving a different effect.
+
+  `ctrlrun effects` says what each effect is holding, so `--state ambiguous` answers "what is
+  pinning this grant". It says **spent** for a committed effect and **holds** for every other,
+  because §7.2 defines held as the part that has not committed and one word for two numbers would
+  make the two commands disagree.
+
+  `ctrlrun stats` reports the ledger's row count, so growth is observable before it is a problem.
+  The ledger only grows: the kernel deletes no row, ships no retention command and has no policy
+  key that expires evidence. What §7.3 owes instead is the invariant that makes somebody else's
+  archiving safe, and it states it: rows older than the longest window on any budget of a grant
+  cannot affect any future decision.
+
+  `ctrlrun.budget/v1` is its own document rather than a key inside `ctrlrun.inspection/v2`,
+  because that one answers about an action and this answers about a grant: a reader handed one
+  would have to know which of two shapes it got. Every existing `--json` shape is unchanged, and
+  T436 asserts that rather than assuming it.
+
+### Changed
+
+- `ctrlrun.receipt/v6` carries `scope_hash` beside `task`, and `ctrlrun.guarantees/v5` carries
+  **G23** beside G24.
+- `ctrlrun.policy/v7`, `ctrlrun.receipt/v6` and `ctrlrun.guarantees/v5`. `tasks:` and `budgets:`
+  on a grant are refused in a `v6` document rather than ignored, because an older reader would
+  grant the action on every task and against no limit. **`DIMENSIONS` grows from six entries to
+  eight**, `tasks` and `budgets`, and it is exported and iterated by `verify`'s G9, so a `--json`
+  consumer counting dimensions sees eight.
+- The shipped `examples/authority/payments.yaml` binds its `head-of-support` grant to
+  `refund-run:*` and gives it a daily budget, so the milestone's own guarantees are not `N/A` on
+  what this repository ships. The authority badge moves from `verified 19/19` to
+  `verified 22/22`, G22, G23 and G24.
+
+- `docs/SPEC-v0.9.md`, the v0.9 "Envelope" contract: consequence budgets, scope providers and
+  task-bound authority, as a delta over v0.1 to v0.8. Documentation only. It specifies the
+  quantitative half of authority, which `VISION.md` §5 has had no code under it: a grant says
+  `amount_lte: 5000` and is silent about the thousand actions that each pass it.
+
+  Four rules the milestone is measured against, recorded here because each one is a decision that
+  could have gone the other way. A budget is **consumed on reserve, inside the reservation's
+  transaction**, because a check on one line and a consumption on another is a race two processes
+  win together. **Ambiguity is not a refund**: an `AMBIGUOUS` effect holds its consumption until a
+  human or a hook resolves it, because otherwise an agent that can generate ambiguity can generate
+  authority. **A budget names a metric, not a consequence**, so nothing here ranks, scores or
+  classifies an operator's actions. And **a scope provider answers a question rather than detecting
+  a change**, which is what separates it from the precondition fingerprint of `SPEC-v0.7.md` §6.
+
+  The specification amends one frozen surface: `StateStore`, frozen since `SPEC-v0.6.md` §9.2, gains
+  `charges=` on the two methods that reserve. §3.3 argues it against that section's stated bar.
+
+### Stricter than 0.8.0, with what 0.8.0 did
+
+- **A 0.8.0 binary refuses a store 0.9.0 has opened.** Migration `0007_budget_ledger` adds the
+  ledger table, and an older binary opening the migrated database refuses at open, naming the
+  migration it does not know. Before: there was no `0007`. This is `SPEC-v0.6.md` §3.5's rule and
+  it makes the upgrade one-way per store: a rollback to 0.8.0 needs the database it had, because a
+  migration that only runs forwards turns a rollback into silent corruption.
+
+- **A third-party `StateStore` must implement three more things.** `charges=` on `reserve_effect`
+  and `consume_approval_and_reserve`, and a `consumptions()` read. Before: `StateStore` was frozen
+  at `SPEC-v0.6.md` §9.2 and a backend implementing every declared method was complete. A backend
+  that implements `charges=` and not the read satisfies the protocol and breaks `ctrlrun inspect`
+  and `ctrlrun verify`, which is why `SPEC-v0.9.md` §3.3 argues the read as part of the amendment
+  rather than leaving it implicit.
+
+- **`DIMENSIONS` changed value, from six entries to eight.** It is exported and `verify`'s G9
+  iterates it and prints its length, so a `--json` consumer counting dimensions sees eight. Before:
+  six. `tasks` and `budgets` are the two.
+
+- **`tasks:` and `budgets:` are refused in a `ctrlrun.policy/v6` document**, rather than ignored as
+  an unknown key would be. Before: neither key existed. An older reader that ignored them would
+  grant the action on every task and against no limit, which is the fail-open this refusal closes.
+
+- **A grant carrying a budget refuses an action that resolves no effect key.** Before: an action
+  with no `effect:` template was permitted, and it still is on any grant without a budget. With one,
+  it is refused: there is nothing to charge against, so an agent proposing such actions would spend
+  nothing against every budget on the chain for ever. `SPEC-v0.9.md` §2.4.1 records the two probes
+  that moved this out of the loader.
+
+- **A metric value that is negative, missing, or not an integer is refused**, with `ACTION_DENIED`
+  and a `denied` receipt. Before: no metric existed. A negative amount would reduce the rolling sum
+  and refill the budget, which is the compensation `SPEC-v0.9.md` §12 forbids; a missing one
+  counted as zero would turn the absence of a field into unlimited authority.
+
+- **`ctrlrun verify` sizes its own action vector to a grant's budgets.** Before: it synthesized a
+  vector to land in a rule and reported a budget refusing that action as an internal error, exit 3,
+  on guarantees with nothing to do with budgets. Where no value fits a band, the guarantee is now
+  `N/A` with a reason that names the action and the grant.
+
+### Fixed
+
+- **`resolve_effect` released no budget hold.** It does not go through `_transition`, so a human
+  resolving an `AMBIGUOUS` effect `FAILED` held its charge for ever: the one act meant to free a
+  budget was the one path that did not. Fixed in all three backends, inside the same transaction as
+  the record's own write.
+
+- **A refused receipt claimed a charge it never made.** `budget_charges` was stamped where the
+  charges were computed, so a refusal raised later in the same loop reached the receipt with them
+  set, and a `denied` receipt asserted the action charged the very grant it was refused from
+  spending against. A receipt asserting a spend that never happened is the one thing an evidence
+  trail may not do.
+
+- **An oversized stored window crashed every evaluation in the deployment.** `Authority.evaluate`
+  reads every delegation row on every evaluation, and an unreadable window raised `OverflowError`
+  out of it, so one corrupt row denied nothing and crashed everything, for every principal and
+  every action, with no event and no receipt to find it by. It is `authority_unreadable` now.
+
+## [0.8.0] - 2026-09-12 - Oversight
+
+Every guarantee shipped before this one verifies the principal that **acts**. G7 refuses an action
+whose requester cannot be resolved; nothing whatever was asked of the principal that **permits** it.
+`approver` was a non-empty string, `ctrlrun delegate --as` was an assertion typed at a shell, and
+the operator MCP server authenticated who answered without checking they were entitled to. v0.8
+asks the question all seven put only to the acting side: **who may say yes, and can the kernel
+tell?**
+
+Five guarantees answer it — G17 an unentitled approver, G18 the requester cannot approve, G19 one
+principal counts once, G20 a credential revoked before its `exp`, G21 an unapproved policy decides
+nothing — and one thing that is not a guarantee: break-glass, which is a grant and not a flag.
+
+**Opt in, then fail closed.** A deployment that names no approver identity behaves exactly as
+0.7.0 did, and a test drives the whole approve-and-execute path to prove it. One that names one has
+no partial mode, no "resolve if you can", and no setting that puts the string back. There is no
+`skip_entitlement`, no `trust_approver`, no `allow_self_approval`, no `break_glass=True`, no
+`ignore_revocations` — and that sentence is a test, not a claim: the shipped package is grepped for
+sixteen spellings a flag would take, and the control plants one and finds it.
+
+**What v0.8 does not close, in one place.** A persuaded approver gives a valid approval and the
+receipt records it as one. An entitlement check is against what the granting surface **recorded**,
+not a re-derivation from a credential that no longer exists. A revoked credential leaves a log line
+and no receipt. A feed is worth what its source is worth. And a policy change that no verified
+principal other than the proposer approved decides nothing — which is not the same as saying a
+policy cannot be changed by whoever holds the file.
+
+### Added
+
+- **A policy change is a protected action** (`docs/SPEC-v0.8.md` §8). The policy is the one file
+  that decides every other decision, and until now it was changed by editing it. v0.6 made the
+  change **evidenced**: every receipt records the hash of the policy that decided it. v0.8 makes it
+  **approved**: a policy nobody approved decides nothing.
+
+  ```
+  ctrlrun policy propose --file new.yaml
+  ctrlrun approve <request>              # there is no `ctrlrun policy approve`
+  ```
+
+  ```python
+  Control(policy, store, require_approved_policy=True)
+  ```
+
+  **An ordinary action, which is why §8 adds no event type.** `ctrlrun.policy.change` has an
+  ordinary action hash, an ordinary effect key (`policy:<hash>`), ordinary events and an ordinary
+  receipt, so §2, §3 and §4 apply with no second path to keep correct: an unverifiable approver is
+  refused, an unentitled one is refused, a proposer approving their own change is refused, and
+  M-of-N counts. A committed receipt for that action **is** the approval of that hash.
+
+  **The approval is per deployment, and that is not obvious.** The hash folds in the effective
+  authority and the effective environment, so the same file in `staging` and in `prod` is two
+  hashes and needs two approvals — which is what an operator wants and what nothing else would say.
+  Comments, key order and whitespace do not move it.
+
+  **The name is reserved and declarable**, and a first draft had that backwards. A document may
+  declare `ctrlrun.policy.change` under `ctrlrun.policy/v6`; nothing else may name it in a
+  `resource:` or `effect:` template. Under `require_approved_policy` the policy in force must
+  declare it with `decision: approve` — a policy that declares it `allow`, or omits it, decides
+  nothing, with the refusal naming the key. That is the rule that closes the obvious escape:
+  installing such a policy still needs an approval under the old one, and the moment it is
+  installed the deployment stops deciding anything.
+
+  **`ctrlrun policy replay --file new.yaml --last N`** reports which recorded decisions change
+  under a proposed policy. It writes nothing, executes nothing and reserves nothing, and it reports
+  *what changes* — never safer, riskier, too permissive, a score or a grade. A receipt whose action
+  cannot be rebuilt is named and skipped, never counted as unchanged.
+
+  **What it does not close, in full.** An administrator with write access to the policy file can
+  still widen *who* may approve the next change. What they cannot manufacture is the approving
+  principal: the approver's credential is verified by the provider configured in code, and §4.1
+  refuses their own. So the property is exactly **"a policy change that no verified principal other
+  than the proposer approved decides nothing"**, and not "a policy cannot be changed by whoever
+  holds the file". An approval also binds a hash and not an ordering, so any hash ever approved
+  stays approved and a superseded policy can be restored with nothing in the evidence saying so.
+
+  `ctrlrun verify` grades **G21** with the flag set by verify, under a note rather than an `N/A`.
+
+- **A credential revoked before its `exp` is refused** (`docs/SPEC-v0.8.md` §6). `jwt_identity.py`
+  used to say, in as many words, that *a verified token is valid until its `exp`* and that nothing
+  polls. Both sentences are gone.
+
+  ```python
+  from ctrlrun.revocation import FileRevocationFeed
+
+  JWTIdentityProvider(..., revocations=FileRevocationFeed(path, issuers=[ISSUER]))
+  ```
+
+  Security Event Tokens are consumed, from a file the operator's own transmitter writes or by RFC
+  8936 poll delivery. **Nothing subscribes and nothing introspects**: a subscription needs an
+  endpoint this project serves and an introspection call is a question it asks nobody. Consuming an
+  event is reading it.
+
+  **The match is against the token's own `iss`, `sub` and `jti`, never against
+  `Principal.agent`.** `agent` is whatever `agent_claim` names, which a deployment may set to
+  `client_id`, so matching an `iss_sub` identifier against it would compare two different things
+  and admit exactly the deployment the feature was bought for. The check runs inside the provider,
+  where the raw verified claims are still in hand, and nothing new is stored on `Principal`.
+
+  **Two things this closes less than it sounds, both stated wherever the feature is described.** A
+  revoked credential leaves a **log line and no receipt**: resolution happens before an action
+  exists, so there is no `action_id` to attribute a refusal to, where an *expired* credential
+  leaves a receipt. And a feed is worth what its source is worth: whoever can write the file can
+  refuse the operator's own agents, which is a denial of service against them and is fail-closed.
+  They cannot **admit** a principal the issuer revoked, because the feed is only ever consulted to
+  refuse. That asymmetry is the security property.
+
+  **`max_staleness` is the operator's call.** Unset means no bound, which is 0.7.0's availability.
+  Set, and every principal of a covered issuer is refused past it with `revocation_feed_stale`,
+  because "has this been revoked" is exactly the question a stale feed cannot answer. Configuring
+  it makes the feed's availability part of the deployment's, and a kernel choosing that for an
+  operator would be choosing their outage budget.
+
+  Behind `ctrlrun[identity]`, beside the provider it serves. `import ctrlrun` imports no part of
+  it. `ctrlrun verify` grades **G20** against a feed verify supplies, with a note saying so rather
+  than an `N/A` claiming something about a document that is silent on the subject.
+
+  No standards claim. RFC 8935, RFC 8936, RFC 9493 and CAEP are consumed as code, and the words
+  compatible, conformant, aligned and certified appear nowhere.
+
+- **Break-glass is a grant, and there is no flag** (`docs/SPEC-v0.8.md` §5). An incident needs
+  authority nobody was granted in advance. The wrong answer is a setting: a setting leaves no
+  record, expires never, cannot be revoked and cannot be narrowed. `authority.py` already has
+  grants that are all five, so break-glass is a delegation beneath an **envelope** the policy
+  declared in advance.
+
+  ```yaml
+  authority:
+    break_glass:
+      incident-payments:
+        subject: {agent: "oncall-*"}     # who a grant opened here may be FOR
+        actions: ["payments.*"]
+        constraints: {amount_lte: 50000}
+        max_ttl: PT4H                    # the longest expiry a grant beneath it may carry
+        controls: [incident-response]    # whose approver_role gates who may OPEN it
+  ```
+
+  **There is no CLI command for it in 0.8.0.** One was built and withdrawn before the release:
+  the CLI builds a `Control` that wires no approver identity, and there is no configuration key
+  for one, so `ctrlrun break-glass` could not succeed in any configuration the CLI can load. It
+  failed closed, which is the right direction and not a reason to ship it — a command that cannot
+  work is a claim the CLI makes that the code does not honour. Opening an envelope in 0.8.0 is
+  reached from an application that built its own `Control`; the shell surface returns in the
+  milestone that gives the CLI a way to verify an approver. `docs/SPEC-v0.8.md` §14.5 records the
+  two alternatives and why each was worse.
+
+  **The envelope decides nothing, by construction.** It lives in `Authority.envelopes`, a mapping
+  separate from `grants`, because the candidate set is every entry of `grants` unconditionally: an
+  envelope living there would decide actions, which is the opposite of what it is for. The test
+  asserts it is absent from the candidate set rather than merely unmatched.
+
+  **It is covered by the policy hash, `max_ttl` included.** The argument for declaring the widest
+  authority an incident can reach in a file is that somebody reviewed it *before* the incident, and
+  that argument is only true if widening it moves every receipt.
+
+  **There is no `--as`.** Whoever opens one is the principal the deployment's approver identity
+  resolves, gated by the envelope's `controls:`; a deployment that names no approver identity
+  cannot open one at all. An assertion typed at a shell is exactly what break-glass must not
+  accept.
+
+  **What it is afterwards**: recorded, with `created_via: break-glass`; expiring, and bounded by
+  `max_ttl` from the moment it was opened; revocable, and revoking it stops everything beneath it;
+  attenuable, obeying `child ⊆ parent` on every dimension. A setting has none of those.
+
+  **`Receipt.authority_grant_id`** now names the grant that decided the action, for **every**
+  action decided by authority and not only under break-glass. A field exercised only on the rare
+  path is one nobody notices breaking.
+
+  `created_via` gains its third value, which is a public change rather than an addition: the
+  vocabulary is a closed set and a record carrying an unknown value is unreadable, which answers
+  `authority_unreadable` for every action in the deployment. It moves with every reader in one
+  commit.
+
+  No guarantee id. The roadmap assigned five to v0.8 and G22 to G24 to v0.9, so inventing a sixth
+  would collide or renumber, and a renumber is the maintainer's change. Its evidence is its tests,
+  and one of them greps the shipped package for sixteen names a flag would be spelled as.
+
+- **M-of-N approvals** (`docs/SPEC-v0.8.md` §4). An action may require more than one yes, and what
+  the threshold counts is **distinct verified principals**: a second answer from a principal that
+  already answered is recorded, moves that entry's `granted_at`, and does not move the count.
+
+  ```yaml
+  schema: ctrlrun.policy/v6
+  actions:
+    payments.refund:
+      decision: approve
+      approvals_required: 2
+  ```
+
+  **The count is decided where the row is written, on all three stores**, and never by a read
+  followed by a write: SQLite counts inside its `BEGIN IMMEDIATE` transaction, Postgres
+  compare-and-sets on the approver list it read and retries, and the in-memory store holds its
+  lock. Two processes answering at the same instant produce two approvers or one, never a
+  threshold reached twice.
+
+  **A yes that cannot be attributed does not count.** `approvals_required` above 1 in a deployment
+  that names no approver identity is a denial, not a silent downgrade to one approval: the kernel
+  cannot tell two anonymous yeses apart, so it refuses rather than counting them. `ctrlrun approve`
+  records no verified approver and therefore never counts toward a threshold, which the CLI says
+  at the moment it is used rather than leaving to be discovered.
+
+  `ApprovalStore.grant_approval` now returns `Approval | None`, where `None` means **recorded and
+  still short of N**. Nothing is granted, no `APPROVAL_GRANTED` event is written, and a consume
+  attempted below the threshold is refused as `pending` with nothing reserved.
+
+  Needs `ctrlrun.policy/v6`. `ctrlrun verify` grades **G19** under `ctrlrun.guarantees/v4`, `N/A`
+  where every action in the document takes one approval.
+
+- **Entitlement from the control registry** (`docs/SPEC-v0.8.md` §3). A control may now name the
+  role that answers for it, and an approval whose recorded entitlement does not cover the roles
+  the request pinned is refused, with the control named in the message, the exception and the
+  `APPROVAL_INVALIDATED` event.
+
+  ```yaml
+  schema: ctrlrun.policy/v6
+  controls:
+    card-data-handling:
+      title: Cardholder data changes are approved by a named owner
+      approver_role: payments-owner
+  ```
+
+  **ctrlrun does not interpret the role.** It does not know what `payments-owner` means, does not
+  check that such a role exists anywhere, and makes no compliance claim on the strength of one,
+  exactly as it does not interpret `source:`. What changed about `SPEC-v0.6.md` §7.3's
+  "attribution, not prevention" is one sentence: a control still decides no *action*, and now
+  decides **who may answer an approval the decision already required**.
+
+  **Omission is not entitlement, and a control naming no role gates nobody.** Two sentences that
+  mean opposite things: a principal whose claims lack the role is not entitled, because a missing
+  claim is a statement about a person and the kernel refuses to invent one; a control with no
+  `approver_role` gates nobody, because a missing role is a statement about the operator's
+  document and inventing one there would refuse every approval in every deployment that has
+  controls and has not heard of v0.8.
+
+  **Roles are matched byte for byte**, in both claim shapes. No case folding, no trimming, no
+  prefix matching and no pattern grammar: a wildcard in a role would be an entitlement nobody
+  wrote. Where an evaluation cites several controls, **every** required role must be held, because
+  any-of lets the weakest control in the set decide who may answer.
+
+  **`ClaimValue` gains a tuple of strings**, amending `SPEC-v0.3.md` §2.1. A roles claim is a JSON
+  array at every issuer anybody deploys, and the old rule meant such a claim arrived *absent*, so
+  its holder was silently unentitled. `JWTIdentityProvider` carries an array-of-strings claim now
+  instead of dropping it, and says so at WARNING rather than DEBUG when it drops anything else it
+  was asked to carry. Safe for hashes: `v0.3 §2.2` keeps claims out of an action's canonical form.
+
+  **The check is bounded and the bound is stated.** What the kernel refuses is an approval whose
+  *recorded* entitlement does not cover the role; what entitled it was decided where the credential
+  was verified, which is the operator MCP server (`ctrlrun mcp-operator --approver-roles-claim`)
+  and an embedding application. `docs/SPEC-mcp-operator.md` §4.3 and §10 are amended to say that,
+  and §4.3 now carries a three-row table instead of one sentence, because the sentence covered
+  two unconfigured cases that behave in opposite ways: a control naming no role admits any
+  verified human, and a control naming a role in a deployment with no claim to read roles from
+  refuses **everyone**. The server warns about the second at startup rather than at the first
+  refusal.
+
+  Needs `ctrlrun.policy/v6`. `ctrlrun verify` grades **G17** under `ctrlrun.guarantees/v4`, `N/A`
+  with a reason that is true of a document naming no approver role.
+
+- **The approver is a principal** (`docs/SPEC-v0.8.md` §2, §4.1). `Approval.approver` is a string
+  whose only check is that it is not empty, and `adapter.py` has always conceded what that string
+  often is: a channel, wherever the framework's primitive does not identify a person. A deployment
+  may now name an **`ApproverIdentity`**, and where one is named an approval is consumable only if
+  the store holds a **`VerifiedApprover`** for it: a principal the granting surface resolved,
+  recorded on the approval row, and carried onto the receipt.
+
+  **Opt in, then fail closed**, which is `SPEC-v0.3.md` §1.2's rule for authority applied to the
+  approver. A `Control` built without one behaves exactly as 0.7.0 did, asserted field by field on
+  the whole approve-and-execute path. One built with it gets no partial mode: an approval whose row
+  carries no verified approver is refused with `approver_unverified`, **including one granted
+  before the provider was configured**, including one granted through a surface that cannot
+  resolve, and including one held by a store that ignores the column.
+
+  **`ctrlrun verify` grades seventeen guarantees now**, G18 among them under
+  `ctrlrun.guarantees/v4`: an approval granted by the principal that requested the action is
+  refused, compared on the resolved principal and never on the string. Verify supplies the approver
+  identity it grades against, so what it reports is the kernel's refusal and never whether an
+  operator configured anything, which is a fact about their application and not about their
+  document.
+
+  **Which surfaces can produce a verified approver, stated plainly because it is narrower than the
+  feature's name suggests.** The operator MCP server can, and now does: it has resolved a principal
+  for every request since it shipped and then discarded it into `mcp-operator:<user>`. An embedding
+  application can. **`ctrlrun approve`, the webhook and the adapters cannot**, and the approvals
+  they grant are refused wherever an approver identity is configured. A deployment whose approvals
+  arrive through one of those three turns its approval path off by configuring this, which is the
+  rule working rather than a defect, and §2.6's table is the thing to read before configuring.
+
+  **Observe mode now records a mismatch's own reason where it recorded one constant for all of
+  them.** `would_have.blocked_reason` said `approval_mismatch` for every `ApprovalMismatch`, so a
+  moved precondition and an approver who may not answer were one word in a report. Recording the
+  specific reason for the approver refusals alone would have left a vocabulary nobody can explain,
+  so every mismatch records its own. This reaches refusals that have nothing to do with v0.8, and
+  it is listed here rather than left for an operator to notice in a diff.
+
+  Needs `ctrlrun.receipt/v5`, which adds `approvers` and `authority_grant_id`, and migration
+  `0006_verified_approver`. Every reader upgrades before any writer switches (`SPEC-v0.3.md`
+  §12.2).
+
+- **`ctrlrun revoke --created-by PRINCIPAL` and `--under ID`** (`docs/SPEC-v0.8.md` §7). During an
+  incident the operation an operator reaches for is *everything this principal issued* or
+  *everything under this grant*, and until now that was a script over the events file, written
+  under pressure. Both are queries over rows that already exist: no new `StateStore` method, no
+  bulk statement, and no transaction over the set. **Each match is revoked exactly as one id is**,
+  one at a time, so a run that stops halfway leaves the rows it reached revoked and the rest
+  untouched, and a second run finishes. `--created-by` takes `AGENT` or `AGENT/USER`, splitting on
+  the first `/` as `ctrlrun delegate --as` does; `--under` reaches the subtree at every depth and
+  is strictly beneath, so it leaves the id it names alone. A selector that matches nothing **exits
+  non-zero** and says what it searched for, because during an incident a mistyped name that exits 0
+  reads as a finished job. Still no `unrevoke`, in any costume.
+
+  **`--by` is unchanged and still means who performed the revocation.** The roadmap called the new
+  selector `--by <principal>`, which is the opposite meaning on an option that already exists, so
+  the selector is `--created-by` and every script written against 0.7.0 keeps working.
+
+  **What a killed run can leave, stated because the tests bound it rather than assume it:** a
+  revoked row whose `DELEGATION_REVOKED` event was never written. `Control.revoke` writes the row
+  and then appends the event, with no transaction over the pair, so a `SIGKILL` between them leaves
+  one row unaccounted for in the log. That is 0.3 behaviour for a single `ctrlrun revoke` too; a
+  selector only makes the window easy to land in.
+
+### Documentation
+
+- **`docs/SPEC-v0.8.md`**: the v0.8 "Oversight" contract, a delta over v0.1 to v0.7. No code lands
+  with it. It asks one question: *who may say yes, and can the kernel tell?* Seven milestones have
+  verified the principal that acts, and nothing has ever been asked of the principal that permits:
+  `approver` is a non-empty string, `ctrlrun delegate --as` is an assertion typed at a shell, and
+  the operator server authenticates who answered without checking that they were entitled to.
+  Seven items answer that: revocation by selector, the approver resolved as a principal,
+  entitlement from the control registry, M-of-N on distinct verified principals, break-glass as a
+  recorded expiring grant rather than a flag, credential revocation consumed from Shared Signals
+  and CAEP events, and a policy change as a protected action with a diff replay beside it. Tests
+  come from §10 (T272 onward); public names are frozen in §11; guarantees G17 to G21 join
+  `ctrlrun.guarantees/v4`, and `ctrlrun.receipt/v5` and `ctrlrun.policy/v6` each move once.
+
+  **The rule the whole document is built on is opt in, then fail closed**, which is
+  `SPEC-v0.3.md` §1.2's rule for authority applied to the approver: a deployment that names no
+  approver identity behaves exactly as 0.7.0, and one that names one gets no partial mode, no
+  fallback to the string, and no setting that turns a check off.
+
+  **Reading the code changed nine things the plan had assumed**, and §1.4 lists them: five from the
+  drafting and four from the independent review, which found the first draft unbuildable in four
+  places and is recorded rather than quietly fixed. Five matter beyond this document.
+
+  `Control` never grants an approval, so the check that matters lives at the consumption and not at
+  the grant. `Control._recheck` returns early on the default path, so a check added after it would
+  have been dead there, green, and invisible to a mutation table. A `Principal` could not carry a
+  list, and every issuer's roles claim is one, so `ClaimValue` gains a tuple of strings. The
+  Postgres grant's compare-and-set was on a status that does not change at N-1, which is a lost
+  update and one principal filling two slots. And a reserved action name no document may declare
+  is a name every proposal is denied for, so the policy-change action is reserved *and* declarable.
+
+  Smaller, and worth knowing before anyone scripts against it: `ctrlrun revoke --by` already means
+  who performed the revocation, so the new selector is `--created-by` and every script written
+  against 0.7.0 keeps working.
+
+  **What it does not close is in §1.1, before anything else**: a persuaded approver gives a valid
+  approval and the receipt records it as one, and an administrator with write access to the policy
+  file, the store or the code is outside every guard here.
+
+## [0.7.0] - 2026-09-11 - Execution boundary
+
+Every milestone before this one asked what holds *inside* ctrlrun. v0.7 asks whether it holds at
+the edges the kernel does not control. The kernel does not decide whether the remote acted, an
+executor does. It does not own the clock its leases are measured against, once the store is on
+another host. It does not know whether the world still looks the way it did when a human said
+yes. Six items answer those edges:
+
+| What it adds | Where |
+|---|---|
+| **`ctrlrun.transport`**, the `NotExecuted` classifier, in core and stdlib only. One rule, promoted out of `ctrlrun[gateway]` rather than copied, reachable from `@protect`. | §2 |
+| **Clock-skew detection.** `PostgresStateStore` measures its server's clock against this host's and names divergence with a new event. It observes and reports, and changes no decision. | §3 |
+| **Attempt numbers that never repeat.** Three Postgres defects that could hand one attempt number out twice, or move it backwards, fixed before v0.7 made the number load-bearing. | §5.6 |
+| **The provider idempotency token**, `ctrlrun.idempotency_token()`, derived from `(effect_key, attempt)`: a deterministic handle for reconciliation, and one that changes on a renewal. | §4 |
+| **The attempt ceiling**, `max_attempts`, a policy key bounding renewal after `FAILED`. Needs `ctrlrun.policy/v5`. | §5 |
+| **Precondition fingerprints**, an approval bound to the resource state it was granted against and rechecked strictly before the reservation. Needs `ctrlrun.receipt/v4`. | §6, §7 |
+
+Section numbers are `docs/SPEC-v0.7.md`, which is the contract; §9 freezes every public name
+added here. `ctrlrun verify` now grades sixteen guarantees under `ctrlrun.guarantees/v3`, G12 to
+G16 being new, each with a positive control and each `N/A` only for a reason that is true of the
+document it was handed. `pip install ctrlrun` still installs `pyyaml` and `click` and nothing
+else, `import ctrlrun` still imports no module from an extra, and `ctrlrun demo` still runs every
+scenario in under a minute with no network.
+
+### Stricter than 0.6.1, with what 0.6.1 did
+
+Everything here can refuse, or record as unknown, something 0.6.1 accepted or recorded as
+settled. Nothing here is a flag, and no setting relaxes any of it.
+
+- **A continuation leg never records `FAILED`.** A continuation exists only because the remote
+  answered and is holding the exchange, so nothing on that leg can say the remote did nothing.
+  At 0.6.1 a refused connection on a continuation, a pre-dispatch JSON-RPC code, the `401` rule
+  of `v0.2 §6.8` and a tool error under an operator's `not_executed_on_error: true` each recorded
+  `FAILED`, and the gateway answered the client `-41011` "not executed", **which permitted a
+  retry** of an effect the upstream may have been part-way through. The gateway now records
+  `AMBIGUOUS` and answers `-41010`, and the effect needs `ctrlrun resolve`. The upstream's own
+  response is relayed unchanged, tool error included.
+- **Behind a proxy the gateway claims nothing.** httpx reports an unreachable proxy and a TLS
+  failure with the *target* after the proxy answered the `CONNECT` line with the same
+  `ConnectError`, and a written `CONNECT` line is a written byte. At 0.6.1 the forwarder mapped
+  every `ConnectError` to `NEVER_CONNECTED`, therefore to a `failed` receipt and `-41011`. Where
+  `urllib.request.getproxies()` names a proxy, `ConnectError` and `ProxyError` are now an unknown
+  outcome: `AMBIGUOUS`, `-41010`, and a `ctrlrun resolve`. `NO_PROXY=*` is honoured and a
+  narrower `NO_PROXY` is not consulted, so a bypassed host is judged as if it were proxied, which
+  costs a claim and never makes a false one. With no proxy configured nothing changes.
+- **`ctrlrun.policy/v5`.** A document that declares `max_attempts` must declare `v5`; 0.6.1's
+  newest schema was `v4`, and a `v4` document naming the key is a `PolicyError` at load, with the
+  key, the action and the line. Every document that loaded at 0.6.1 loads unchanged and renews
+  without bound, because there is no default ceiling and no value of the key means "unlimited".
+  An 0.6.1 reader refuses a `v5` document, as it should.
+- **`ctrlrun.receipt/v4`.** Two new fields, `precondition_at_request` and
+  `precondition_at_recheck`. **Upgrade every reader before any writer**: a `v4` JSONL line handed
+  to 0.6.1 rehashes wrongly and reads as altered. Rendering is stricter in the other direction
+  too, and visibly: `to_dict()`, `ctrlrun receipts --json` and `ctrlrun inspect` render each
+  receipt under the schema it was written with, so a pre-v0.6 receipt shows its own `v1` or `v2`
+  label and keys where 0.6.1 showed `v3`. A key added to a stored receipt, a relabelled `schema`,
+  a removed one or an unknown one is `content_altered` at its `seq`, where a reader could have
+  missed it before.
+- **Migration `0005_precondition_fingerprint`, and a store no 0.6 process may still hold.** A
+  database built by 0.6.1's own code migrates keeping every row, and 0.6.1 then refuses it at
+  open, naming `0005`. **Stop every 0.6 process before any 0.7 process opens the store**: a store
+  checks migrations only at open, so a 0.6.1 process already running would consume a fingerprinted
+  approval with no comparison, *and* would rehash every `v4` receipt under `v3`'s keys and report
+  a correct chain as altered. The trigger is the first receipt a 0.7 process writes, not the first
+  caller that passes `preconditions=`.
+- **A precondition, once one exists, is never skipped.** An approval that carries a fingerprint,
+  presented by a call that names no provider, is refused rather than consumed: that includes the
+  gateway and the ACS hook, which name none. A provider that raises, hangs or returns something
+  with no canonical form refuses the action and reserves nothing. There is no
+  `skip_preconditions` and no timeout parameter.
+- **The attempt ceiling is stricter only where an operator asks for it**, and then it is
+  absolute: above the ceiling the executor is not called, on any route, and `ActionDenied` names
+  `attempt_ceiling`.
+- **`ctrlrun verify` opens loopback sockets it bound itself.** `v0.4 §3.7`'s "no scenario opens a
+  socket" becomes *no connection except to the store `--store-url` names and to loopback
+  listeners verify bound itself*, because G12 needs a peer that can receive a byte. The old
+  sentence was already untrue under `--store-url postgresql://remote-host/…`. The test suite's
+  network guard admits exactly that and no more: IPv4 to the `127.0.0.1` literal, at a port this
+  process bound through a stream socket that is still open. `localhost`, `::1`, `0.0.0.0`, every
+  `AF_UNIX` path and every datagram send are refused.
+
+### What this release does not close
+
+Stated here, and not only in the specification, because each one is a limit somebody operating
+this will meet.
+
+- **A precondition fingerprint narrows the window between a human's approval and the action's
+  execution, and does not close it.** The recheck is a network call, so it runs outside the atomic
+  reservation write, and a change that lands after the comparison and before the reservation is
+  not refused. It takes the exposure from minutes of human deliberation down to milliseconds,
+  which is worth having and is not prevention. T261b opens that residual window and asserts
+  exactly that.
+- **On the reconcile route a doomed attempt still costs a human answer and three provider
+  calls.** Under `max_attempts: 1` on an `approve` action whose retry carries a `reconcile` hook,
+  the approval gate runs before the ceiling's check: a new approval request can be created, a
+  human can grant it, and the reservation that consumes it is then refused with
+  `attempt_ceiling`. One wasted answer, never an execution. On that same route the precondition
+  provider is called **three times**, once on the request pass and twice on the retry, and a
+  provider that is down there makes the refusal `ApprovalMismatch(reason="precondition_unavailable")`
+  rather than `attempt_ceiling`, writes no effect record and never runs the `reconcile` hook, so
+  the operator is told the wrong reason for an attempt that could never have run. The ordinary
+  sequential route calls the provider zero times and refuses before any human is asked. Closing
+  either needs a seam that would make the ceiling's check unreachable from any public route, and
+  a guarantee that could not have failed is not a pass.
+- **`max_attempts` bounds attempts, not executor invocations.** A `Suspended` executor holds its
+  reservation and every `Control.resume` runs on that same attempt, so an elicitation loop is one
+  dispatch however many rounds it takes. The gateway bounds those with `max_elicitation_rounds`;
+  a direct `Control.resume` caller has no bound, and this release adds none.
+- **A refused attempt number is spent.** Raising `max_attempts` from 2 to 4 after a refusal buys
+  one further dispatch, not two.
+- **The classifier's register sees only this library's own sends.** A claim is about the executor
+  run, not about one connection, and `Control` marks a register on every send through
+  `ctrlrun.transport` or `ctrlrun.gateway.transport.request`. An executor that sends part of the
+  effect through `requests`, through httpx directly, or on a raw socket, and then uses the
+  classifier, can be handed a `NotExecuted` that is true of these connections and false of the
+  effect. So can one that raises a claim while a sibling thread's request is still in flight. The
+  claim holds where every request of the effect goes through the classifier on the executor's
+  context, and that sentence is in the module docstring, the class docstring and §2.3.
+- **A reused `action_id` still leaves the attempt a late write is about undecided**, on every
+  backend. The attempt number is now monotonic, so no two reservations of one key carry the same
+  number; what is not closed is attempt *identity*. A transition names its holder by `action_id`
+  alone, so attempt 1's write, arriving after its lease lapsed and after the same `Action` was
+  retried, can read attempt 2's record, find its own id in a state it expects, and land there. A
+  late `fail_effect` is the sharp case: it writes `FAILED` over an executing attempt 2, and
+  `FAILED` is the state that permits a renewal. A `mark_ambiguous` reaches the same place in one
+  more step, through a `reconcile` hook that is asked about the effect key and not about the
+  attempt, so it needs no person. `ctrlrun resolve` carries no attempt number either, so someone
+  who inspected attempt 1 can resolve attempt 2's ambiguity. The fix inside the frozen
+  `StateStore` protocol is a store-side memo of the attempt each reservation wrote, which is a
+  schema change of its own; §12.3a states the argument so the next milestone inherits it.
+- **An approval granted and presented inside `request()` is spent before `Control` knows the
+  request exists** (§6.4). What would take that away is a store call recording a request and its
+  fingerprint in one write, and `StateStore` is frozen.
+- **A malformed *value* of a key a receipt schema declares still raises out of `from_dict`.** One
+  `UPDATE` putting a float among a receipt's `controls` blinds `ctrlrun receipts`,
+  `receipts --verify-chain`, `inspect`, `stats` and G11 together, where the schema-level and
+  added-key cases are each reported at their `seq` and leave every other row readable. 0.6.1
+  behaves the same and v0.7 neither introduces nor widens it. Fixing it needs a new name in
+  `CHAIN_BREAKS`, a closed set on a `v0.6 §6.5` surface, or a reader that walks raw rows; it is a
+  named item on the roadmap before v1.0.
+
+### Added
+
+- **`ctrlrun.transport`, the `NotExecuted` classifier, in core** (SPEC-v0.7 §2, build-list item
+  2). `v0.1 §5.5` leaves the one decision the product exists to get right, `FAILED` or
+  `AMBIGUOUS`, to the executor, and until now the correct rule was reachable only through
+  `ctrlrun[gateway]`. `ctrlrun.transport.urlopen`, `HTTPConnection` and `HTTPSConnection` are
+  `urllib` and `http.client` with a counter: they raise `NotExecuted`, chained from the original
+  exception, **only** where the connection they opened fresh failed before a single request byte
+  was handed to its socket (DNS failure, refusal, connect timeout, a TLS handshake failure). Every
+  other failure is the original exception, which the kernel records `AMBIGUOUS`: a reset or a
+  timeout after the request was offered, a `sendall` that raised part way, a reused connection, a
+  socket the caller set, an opener the classifier did not build, a proxy that refused a tunnel
+  after its `CONNECT` line was sent. The count is taken from evidence, never from an exception's
+  type, and above TLS. No redirect is followed, no HTTP status is ever `NotExecuted`, and no
+  parameter, attribute or environment variable changes a classification. The module is stdlib
+  only and is not imported by `import ctrlrun`.
+
+  The rule itself, `ctrlrun.transport.effect_state`, is the one implementation: the gateway's
+  `Transport` is now the core one, and `gateway/outcome.py` asks the core rule rather than keeping
+  a copy. `ctrlrun.gateway.transport.request` offers the gateway's httpx mapping to an executor
+  that uses httpx, on a client built for the one call. The gateway's own `NotExecuted`, for an
+  upstream it never reached, is now chained from the httpx exception and its receipt names it.
+  `ctrlrun verify` gains **G12**, "a byte written is ambiguous", under
+  `ctrlrun.guarantees/v3`, with the refused connection as its positive control. G12 needs a
+  loopback peer, so verify's rule becomes *no connection except to the store `--store-url` names
+  and to loopback listeners verify bound itself*, and the test suite's network guard admits
+  exactly that: IPv4 on the `127.0.0.1` literal, to a port the process bound through a stream
+  socket that is still open, and nothing else.
+
+  **The claim is about the executor run, not about one connection.** An independent review showed
+  that every false `NotExecuted` it could produce came from two connections in one effect: the
+  first delivered the request, the second was refused, and a per-connection classifier judged the
+  second alone. `xmlrpc.client`'s retry, `FancyURLopener` following a `303`, an opener whose
+  handler runs on a worker thread, and an executor's own retry-once-on-reset loop all make that
+  pair. `Control` now opens a register around each executor call; every send through
+  `ctrlrun.transport` or `ctrlrun.gateway.transport.request` marks it before the first byte, and a
+  claim needs it unmarked as well as the connection's own evidence. Outside an executor run
+  nothing is claimed. **The limit is stated in the module, the class and the specification**: the
+  register sees only this library's own sends, so an executor that sends part of the effect
+  through another transport and then uses the classifier can be handed a claim that is true of
+  these connections and false of the effect. A send through this library on a thread that did not
+  copy the executor's context **is** seen: it belongs to no register, so it marks every register
+  open in the process, which costs claims in unrelated concurrent runs and never safety.
+
+  **A continuation leg never records `FAILED`, and 0.6.1 did.** A continuation exists only
+  because the remote answered and is holding the exchange, so nothing on that leg can say the
+  remote did nothing. `Control.resume` now runs with the register already marked, and the gateway
+  refuses to record `FAILED` for anything a continuation meets: a refused connection, a
+  pre-dispatch JSON-RPC code, the `401` rule of `v0.2 §6.8`, and a tool error under an
+  operator's `not_executed_on_error: true`, which asserts that *that tool* reports errors before
+  acting and cannot speak for a call it did not answer. At 0.6.1 each of those recorded
+  `FAILED` and, for a connection never established, answered the client `-41011` "not executed",
+  which permitted a retry of an effect the upstream may have been part-way through. The upstream's
+  own response is still relayed unchanged; what changes is the record, which is now `AMBIGUOUS`
+  and needs `ctrlrun resolve`.
+
+  **Behind a proxy the gateway is stricter than 0.6.1.** httpx reports an unreachable proxy and a
+  TLS failure with the target after the proxy answered the `CONNECT` line with the same
+  `ConnectError`, and `ctrlrun.transport` counts a written `CONNECT` line as a byte. Where the
+  environment names a proxy, `ConnectError` and `ProxyError` are now an unknown outcome: an
+  intercepted call that would have been recorded `FAILED` with `-41011` is recorded `AMBIGUOUS`
+  with `-41010`, and needs `ctrlrun resolve`. With no proxy configured nothing changes.
+
+- **Clock-skew detection** (SPEC-v0.7 §3, item 1). `PostgresStateStore` measures its server's
+  clock against the application's at open, and again when an expired lease is declared
+  `AMBIGUOUS` (at most once per `DEFAULT_LEASE`), in one round trip whose half is the
+  measurement's bound, so latency alone is never reported as skew. It keeps its latest
+  measurement as the optional, read-only `clock_skew` attribute, a `ctrlrun.state.ClockSkew`;
+  `Control` reads it at the start of every `execute` and `resume` and after an `AmbiguousEffect`,
+  and appends one new event type, `CLOCK_SKEW_DETECTED`, for a measurement past
+  `clock_skew_threshold` (default one second, at most `DEFAULT_LEASE`, and no value switches it
+  off). **It observes and reports, and changes no decision**: every lease is still evaluated
+  against the application clock exactly as at 0.6.1, no reservation outcome changes, and a
+  measurement that fails is logged and changes nothing. Verify gains G13, graded against a
+  Postgres `--store-url` and `N/A` on SQLite, and the catalogue moves to
+  `ctrlrun.guarantees/v3`; the store conformance suite gains a `clock` case, `not_applicable`
+  on SQLite and the in-memory store because neither has a clock of its own.
+- **The attempt ceiling, `max_attempts`** (SPEC-v0.7 §5, item 4, and the amendment to
+  `docs/SPEC-v0.1.md` §5.4). A new action-entry policy key, an integer of at least 1, bounding
+  the **attempts** that may execute on one effect key, the first included: `max_attempts: 3` is
+  the first attempt and two renewals. It needs `schema: ctrlrun.policy/v5`, a new schema version
+  that is a superset of `v4` as `v4` is of `v3`; `0`, a negative, a `bool`, a float, a string and
+  a mapping are each a `PolicyError` at load, naming the key, the action and the line. The ceiling
+  is inside the policy hash, so a receipt records which one refused an attempt.
+  **An attempt, not an executor invocation**: a `Suspended` executor holds its reservation and
+  every `Control.resume` runs on that same attempt, so an elicitation loop is one dispatch however
+  many rounds it takes. The gateway bounds those with `max_elicitation_rounds`; a direct
+  `Control.resume` caller has no bound, and this adds none.
+  **The decision is taken on the attempt number the store assigned**, after the reservation and
+  before the executor, because two callers that both read attempt *N-1* would both pass a read
+  taken before reserving. Above the ceiling the executor is not called, the record is released as
+  `FAILED` with an error naming the ceiling, `EFFECT_RESERVATION_REFUSED` carries
+  `reason: "attempt_ceiling"` with the attempt and the ceiling, a `blocked` receipt is written,
+  and `ActionDenied(reason="attempt_ceiling")` is raised. The refused attempt number is **spent**:
+  raising `max_attempts` from 2 to 4 after a refusal buys one further dispatch, not two. A read of
+  the record before the approval gate refuses the ordinary sequential case earlier, writing
+  nothing, spending no presented approval and creating no approval request; it refuses only a
+  `FAILED` record and is never the guarantee. **On any other route the approval gate comes
+  first**, so on an `APPROVE` action a human can be asked, and answer, for an attempt that is then
+  refused: a wasted answer, never an execution, and `docs/SPEC-v0.7.md` §5.2 and §5.5 say so
+  rather than closing it. In observe mode the refusal is recorded as `would_have.blocked_reason:
+  "attempt_ceiling"` and the action runs. Verify gains **G15**, and G5 and G14 now select only an
+  action whose ceiling permits a renewal, reporting `N/A` where the ceiling is the only reason
+  they cannot, because each one's control *is* a renewal and `max_attempts: 1` would otherwise
+  report a correct kernel as a failure. No new error type, no new event type, no new `StateStore`
+  method, no new `Control` method, and no CLI change.
+- **The provider idempotency token** (SPEC-v0.7 §4, item 3). `ctrlrun.idempotency_token()`, a new
+  zero-argument accessor re-exported at package import, answers inside an executor with the token
+  of the attempt it is running: `ctrlrun.effect.idempotency_token_for(effect_key, attempt)`, a
+  SHA-256 over the canonical form of `(effect_key, attempt)` under the domain tag
+  `ctrlrun.idempotency/v1`, rendered as a 36-character UUID of version 8. Send it to a provider as
+  its idempotency key. **Derived from the attempt and not from the effect key alone**: the effect
+  key is stable across `SPEC-v0.1.md` §5.4's renewal, so a provider given it would answer the one
+  retry the kernel permits, permitted *because the executor proved nothing happened*, with the
+  cached failure of the attempt that failed. It is stable within one attempt, including across a
+  `Control.resume` of a suspended one, and different after a renewal. **What it is for is
+  reconciliation**: a deterministic handle to ask a provider what became of an attempt whose
+  outcome is unknown, by a key the provider already indexes. It does not make a retry safe, and
+  after an `AMBIGUOUS` outcome the kernel still refuses one. Nothing is stored: the token is a pure
+  function of two fields every receipt of an attempt that ran already carries, so a receipt
+  re-derives it and a `reconcile` hook reads the attempt off the record. The executor signature is
+  unchanged, and an executor that never calls the accessor runs exactly as it did at 0.6.1. Outside
+  an executor, for an action with no effect key, for an observe-mode attempt whose reservation was
+  refused, and on a thread started without a copy of the executor's context, it raises
+  `InvalidArgument`. Verify gains G14, with a note beneath the table: a token is unique only as far
+  as the operator's effect keys are, and a kernel that sees one store cannot check that two stores
+  sharing a provider account never produce one effect-key string for two different effects.
+- **Precondition fingerprints** (`docs/SPEC-v0.7.md` §6, §7). `@protect(..., preconditions=provider)`
+  and `Control.execute(..., preconditions=provider)`, where the provider takes the `Action` and
+  returns a mapping of the state an approval depends on. A precondition fingerprint **narrows**
+  the window between a human's approval and the action's execution; it does not close it.
+  Under `APPROVE` the provider is called when the approval is requested, and the result is kept only
+  as a `sha256:` fingerprint on the request (`ApprovalRequest.precondition_fingerprint`, stored in the
+  new `approvals.precondition_fingerprint` column). On the presenting pass it is called again,
+  strictly before the store call that consumes the approval, and the action is refused with
+  `ApprovalMismatch` and a reason of its own: `precondition_changed` where the two fingerprints
+  differ, `precondition_missing` where only one side has one (a store that lost the column, or the
+  gateway and the ACS hook, which name no provider), and `precondition_unavailable` where the
+  provider raises or returns something that is not a canonicalizable mapping. Every refusal reserves
+  nothing and leaves the approval granted. On the request pass a provider that fails refuses the
+  action with `ActionDenied(reason="precondition_unavailable")` before any human is asked, and a
+  fingerprint that is computed and then **not recorded** (a store without the column, a third-party
+  `ApprovalProvider` building its own request) refuses with
+  `ActionDenied(reason="precondition_missing")` and **withdraws the request it left behind** where
+  this call can reach it: denied while it is pending, spent where a grant landed inside the window,
+  and `not_withdrawn:<status>` in the evidence where neither write was possible (the provider raised
+  after recording, or the store refused). §6.4 states that bound and its residual. **A withdrawal is
+  a `deny_approval`**, so `find_denied_request` returns it and the gateway's "no is an answer"
+  pre-check refuses every call for that action hash until the request expires, as though a human had
+  said no: fail-closed, bounded by the TTL, and traceable through the approver
+  `ctrlrun:precondition-not-recorded`. `ALLOW`, `DENY` and `Control.resume` never call the provider;
+  observe mode compares, records and runs.
+  The comparison is a network call, so it runs outside the atomic reservation write, and a change
+  that lands after the comparison and before the reservation is not refused: T261b opens that
+  window and asserts exactly that. Raw provider output reaches no receipt, event, log line or
+  table, and a provider's exception is recorded by its type name only. No `skip_preconditions`,
+  and no timeout parameter: a provider that hangs holds the call and reserves nothing.
+- **Migration `0005_precondition_fingerprint`** adds `approvals.precondition_fingerprint`, `NULL` on
+  every existing row, on SQLite and Postgres. A database built by 0.6.1's own code migrates keeping
+  every row, and 0.6.1 refuses the migrated database at open naming `0005`. **Stop every 0.6 process
+  before any 0.7 process opens the store**: a store checks migrations only at open, so a 0.6.1
+  process already running would consume a fingerprinted approval with no comparison, *and* would
+  rehash every `v4` receipt under `v3`'s keys and report a correct chain as altered. The trigger is
+  the first receipt a 0.7 process writes, not the first caller that passes `preconditions=`, and
+  nothing in the new process can see the old one.
+- **G16 in `ctrlrun verify`**, "a moved fingerprint is refused" before the reservation, under
+  `ctrlrun.guarantees/v3`. Verify supplies its own provider, because a provider is named in code
+  that verify does not read, and the report says so beneath the table; `not applicable` only where
+  no action requires approval. The store conformance suite gains a `precondition-fingerprint` case
+  and a broken-store fixture that fails it by name.
+- **Python 3.13 and 3.14 are tested and declared.** CI's `check` job runs the full suite on
+  3.11, 3.12, 3.13 and 3.14, and the package classifiers name all four. The floor is unchanged:
+  `requires-python` stays `>=3.11`, and mypy and ruff still check against 3.11. No library code
+  changed; the one test fix is below.
+
+### Changed
+
+- **An action entry may declare `max_attempts`, and a renewal over `FAILED` can now be bounded.**
+  This is stricter than 0.6.1 only where an operator asks for it: an action that declares no
+  `max_attempts` renews without bound, exactly as before, and every document that loaded at 0.6.1
+  loads unchanged. There is no default ceiling, and no value of the key means "unlimited".
+
+- **`ctrlrun.receipt/v4`**, with `precondition_at_request` and `precondition_at_recheck`, and the
+  first receipt-schema bump that does not report older receipts as altered. A receipt read from a
+  store is now hashed as the document it was read from (`docs/SPEC-v0.7.md` §6.11, amending
+  `SPEC-v0.6.md` §6.4's last bullet), so every `v3` receipt a released 0.6 wrote still rehashes to its
+  stored hash and a chain spanning `v3` and `v4` verifies end to end. A key added to a stored
+  receipt, a relabelled `schema`, a removed one or an unknown one is `content_altered` at its `seq`,
+  and no longer something a reader could miss. **Visible**: `to_dict()`, `ctrlrun receipts --json`
+  and `ctrlrun inspect` render each receipt under its own schema, so a pre-v0.6 receipt shows its
+  own `v1` or `v2` label and keys where 0.6.1 showed `v3`. Upgrade every reader before any writer:
+  a `v4` JSONL line handed to 0.6.1 rehashes wrongly.
+- **`ctrlrun verify` prints each distinct note once**, where it printed only the first note in the
+  report, which would have dropped G16's beneath G3's. CI's `verify` job expects `verified 13/13`
+  with two not applicable, and `verified 7/7` with eight, measured from a run of the merged
+  catalogue rather than carried over from either branch.
+- **A receipt chain reader no longer stops at a row it cannot hash.** A stored document holding a
+  value with no canonical form (a float, a lone surrogate) made `verify_chain` raise, so one
+  tampered row ended the walk: `ctrlrun receipts --verify-chain` exited with no report and a forged
+  field at another `seq` went unnamed. Such a row is `content_altered` at its `seq`, named by the
+  refusal's type and never its message.
+- **`APPROVAL_CONSUMED` carries what the presenting pass compared**, where a precondition was
+  compared, so a suspended action's resumed leg, whose receipt is the only one it gets, records the
+  comparison its first leg made.
+
+### Fixed
+
+- **`PostgresStateStore.events()` read a missing `action_id` back as the string `"None"`.** An
+  event about no action (the three `DELEGATION_*` types, and now `CLOCK_SKEW_DETECTED` reported at
+  open) named a proposal called "None" on Postgres alone; SQLite and the in-memory store returned
+  `None`. It now returns `None` on all three.
+
+- **The migration tests' release fixtures could not build a venv on some interpreters.**
+  `venv.create` copies the interpreter by default, and a copied binary from a shared-libpython
+  build (uv's CPython 3.14 on macOS) aborted inside `ensurepip`, so all five release fixtures
+  errored before a release was installed. The fixture now symlinks, as `python -m venv` does on
+  POSIX.
+- **The Postgres store could hand out one attempt number twice** (`docs/SPEC-v0.7.md` §5.6).
+  0.6.1's renewal after `FAILED` read the record with a plain `SELECT` and then updated it on
+  `effect_key` and `state = 'failed'` alone. So a renewal planned against attempt *k* could land
+  after another process had renewed to *k+1*, run and failed, and write *k+1* a second time: two
+  dispatches, and two receipts, under one attempt number. The `UPDATE` is now also conditioned on
+  the attempt it was planned from, with the row count checked, and a stale renewal is refused with
+  `DuplicateEffect`. SQLite carries the same condition, where it was already unreachable because
+  `BEGIN IMMEDIATE` holds the read and the write together.
+- **A stale Postgres write could put an older attempt number back** (`docs/SPEC-v0.7.md` §5.6).
+  0.6.1's compare-and-set under `resolve_effect`, `extend_lease`, `hold_continuation`, the kept
+  `AMBIGUOUS` write and the four transitions matched `effect_key`, `action_id` and `state`, and
+  wrote back the attempt number it had read. A caller that retries one `Action` reuses its
+  `action_id`, so the same `action_id` and state could come round again at a newer attempt between
+  the read and the write. A human's `ctrlrun resolve` decided on attempt 1 then wrote `FAILED` at
+  1 over attempt 2's unknown outcome, and the next renewal handed out attempt 2 a second time.
+  **On Postgres**, every write to an effect record is now also conditioned on the attempt it read,
+  and a write whose record moved is re-read rather than landed (SQLite's writes are already inside
+  the `BEGIN IMMEDIATE` that holds their read, and are unchanged). The fix for the renewal above
+  depends on this one: it holds only because the number can no longer move backwards. What this
+  closes is the race between a write's own read and its write. The window a *human* stands in is
+  longer, because `ctrlrun resolve` carries no attempt number: someone who inspected attempt 1 can
+  still resolve attempt 2's ambiguity. An attempt argument on the CLI would close that, and it is
+  not in this change.
+- **A Postgres write that carried an outcome could be refused and drop it.** With the condition
+  above in place, a `commit_effect` or `mark_ambiguous` whose record moved under it wrote nothing
+  and raised, so the effect record, which is what gates the next renewal, said nothing about an
+  attempt that may have acted: a review measured a renewal to a third attempt with a committed
+  refund recorded on no record at all. Both are now re-issued once against the re-read, so the
+  outcome lands on the record as it stands. `begin_execution` and `fail_effect` are still refused
+  there, because `FAILED` asserts that nothing happened and the newer attempt may be running.
+- **A refused write on a moved record claimed the wrong thing.** All of these were
+  `DuplicateEffect(state="in_progress")`, which means *another attempt holds a live reservation*,
+  and after a stale `resolve_effect` the record is `AMBIGUOUS` at a newer attempt, which is nobody's
+  reservation. The refusal now takes its type from what the re-read found, `AmbiguousEffect` or
+  `DuplicateEffect` with `committed` or `in_progress`, and its message names the move.
+- **An unknown outcome could vanish when the store refused to record it**, on both backends and
+  since before 0.6. `Control` caught two store refusals around its outcome writes, and a record a
+  human resolved `FAILED` while the attempt was still running answers a third: an executor that
+  raised `TimeoutError` then produced no receipt and no `EXECUTION_AMBIGUOUS` event, and the caller
+  was handed a store error about its own effect key instead of its executor's exception. `Control`
+  now catches every `CTRLRunError` from an outcome write, writes the receipt and the event whatever
+  the store answered, names the refusal in both, and re-raises the caller's own exception. Nothing
+  is reconciled on a record the attempt could not mark.
+- **Two bounds on the Postgres store's re-issues reset each other.** The stale re-issue and the
+  lost-commit re-issue of `docs/SPEC-v0.6.md` §4.3.2 each carry a flag that permits one attempt,
+  and neither passed the other's flag on, so a lost `COMMIT` inside a re-issue and a re-issue
+  inside a lost `COMMIT` alternated without end: a review drove both halves at once and reached
+  `RecursionError`, which is outside this library's closed set of errors, so no caller can
+  classify it and the record is left stranded. Both flags now travel through both re-issues.
+- **A receipt for an outcome the store refused did not say what the executor had done.** An
+  executor that returned normally and one that raised `NotExecuted` produced identical receipts,
+  naming the store's refusal and nothing else. For the first the remote very likely acted and for
+  the second it very likely did not, and with the effect record carrying neither, that is the one
+  fact whoever runs `ctrlrun resolve` has to go on. The receipt now carries both.
+- **A lapsed Postgres approval could be marked expired over a consumption.** `_expire` wrote
+  `status = expired` on `approval_id` alone, from a read that saw `granted` past `expires_at`, so a
+  consumption committing in between was overwritten and an approval that authorised a real effect
+  read `expired`. It is now conditioned on the status it read, as every other write on that table
+  already was.
+- **After a lost `COMMIT`, a Postgres reservation could return an attempt number it did not
+  write.** Where a reservation's `COMMIT` was lost and the re-read found the write absent, 0.6.1
+  re-issued it and then returned the reservation it had first planned, discarding the re-issue's.
+  If another process had renewed, or inserted, and failed in between, the caller and its receipt
+  held attempt *k+1* while the record held *k+2*, and *k+1* was a number another dispatch had
+  already been handed. The reservation methods now return what the re-issue wrote.
+- **A lost `COMMIT` on a Postgres renewal could take another process's reservation for its own.**
+  0.6.1's re-read accepted any `RESERVED` record carrying the renewal's `action_id` as proof the
+  commit had landed. `docs/SPEC-v0.6.md` §4.3.3 had already ruled that out on the insert path,
+  because `action_id` is caller-supplyable, and a caller that rebuilt the same `Action` renews
+  under the same one. Two processes then held one attempt. The renewal's re-read now applies the
+  same whole-row identity check, and a row that is not its own write is refused.
+
+### Documentation
+
+- **`docs/SPEC-v0.7.md`**: the v0.7 "Execution boundary" contract, a delta over v0.1 to v0.6. No
+  code lands with it. It asks one question: *does it hold at the edges the kernel does not
+  control?* The kernel does not decide whether the remote acted, an executor does; it does not own
+  the clock its leases are measured against once the store is on another host; and it does not know
+  whether the world still looks the way it did when a human said yes. Five items answer those
+  edges: the `NotExecuted` classifier promoted from the gateway into core as `ctrlrun.transport`,
+  clock-skew detection, a provider idempotency token derived from `(effect_key, attempt)`, an
+  operator-set ceiling on renewal after `FAILED` (`max_attempts`, written as an amendment to
+  `SPEC-v0.1.md` §5.4), and precondition fingerprints, which **narrow** the window between a
+  human's approval and the action's execution and do not close it. Tests come from §8
+  (T209 to T271, because T182 to T208 already belong to `SPEC-mcp-operator.md` and `SPEC-scan.md`);
+  public names are frozen in §9; guarantees G12 to G16 join `ctrlrun.guarantees/v3`.
+
+  **Reading the code changed nine things the plan had assumed**, and §1.4 lists them. Four matter
+  beyond this document. On Postgres a renewal could reuse an attempt number, and a lost `COMMIT`'s
+  re-issue could return a number other than the one it wrote; v0.7 makes the number load-bearing,
+  so both are fixed first, in a new **item 3a, "attempt numbers never repeat"**, its own pull
+  request stacked before item 3 and independently reviewed because it changes a store. Bumping the
+  receipt schema the ordinary way would have reported every receipt a released 0.6 wrote as
+  altered, so a receipt now renders under the schema it was written with. In enforce mode one
+  granted approval buys one dispatch, not unlimited ones, because every renewal of an approved
+  action needs a new granted approval; "granted" is not always a human (a scripted provider, an
+  automated `wait=True` loop and approvals granted ahead of a gateway all count), observe mode needs
+  none, and an adapter can still put a human in front of an attempt the ceiling will refuse, which
+  §5.5 records. The unbounded case the ceiling exists for is the action the policy allows outright.
+  And `max_attempts` needs `ctrlrun.policy/v5`.
+
+  **An independent review of the draft found seven blocking defects and nine smaller ones**, and
+  every one became an edit: among them the two store defects above, a G15 that passed with the
+  ceiling's own check deleted, a G5 that would have failed a correct kernel under `max_attempts: 1`,
+  a receipt rule that let a fabricated field verify, three false `N/A` reasons, and a verify
+  network rule that was already untrue under `--store-url`.
+
+- **`README.md`** now says what `ctrlrun.transport` is for beside the sentence that names
+  `NotExecuted`, says that `ctrlrun verify` binds loopback listeners of its own rather than
+  claiming it opens no socket at all, and says that a precondition fingerprint narrows the window
+  between a human's answer and the execution.
+
+- **The documentation site**, `CTRLRun/ctrlrun-docs`, carries the generated pages for this
+  release: every `ctrlrun.transport` name in the Python API reference, `ctrlrun.policy/v5` and
+  `ctrlrun.receipt/v4` in the schema references, G12 to G16 in `verify.md` and in the readiness
+  block, the classifier and the residual precondition window in `THREAT_MODEL.md`, and
+  `CLAIMS.md` regenerated so every cited line number resolves. `ROADMAP.md` marks v0.7 shipped and
+  carries two items named before v1.0: a malformed value of a schema-declared key blinding every
+  receipt reader, and the `state -> receipt -> policy -> authority -> state` import cycle, which
+  contradicts `ARCHITECTURE.md` §6.
+
 ## [0.6.1] - 2026-09-07 — The audit's fixes, and the gateway's transport
 
 Everything found after `v0.6.0` was tagged: twenty-nine defects from an audit of the shipped
@@ -108,10 +1702,10 @@ policy or authority document — and both are listed below with what they did be
   bullet list and the readiness block. Prose is down from 3,205 words to 2,662, with the demo
   transcript, the guarantee matrix, both receipt-chain disclaimers and the whole *It can't*
   section untouched.
-- The documentation home page leads with what CTRLRun is rather than with its own name, and
+- The documentation home page leads with what ctrlrun is rather than with its own name, and
   says the promise once instead of twice above the fold. Its `title` is the category line and
   its `description` the tagline, which is what `docs/IA.md` assigns to each; the browser tab no
-  longer reads *CTRLRun - CTRLRun*.
+  longer reads *ctrlrun - ctrlrun*.
 - `try-it` puts its controls above its explanation, in a wide column, with the policy below
   them rather than between the reader and the button.
 - Four badges: CodeQL, the documentation site, Ruff and `mypy --strict`. Downloads and stars
@@ -185,7 +1779,7 @@ have recovered or retrying work nothing can.
   cannot drift into permitting something SQLite refuses.
 - **`--store-url` accepts a `postgresql://` URL**, and is now on every command that reads or
   resolves the operator's own store — `receipts`, `effects`, `inspect`, `resolve`, `approve`,
-  `deny` — reading `CTRLRUN_STORE_URL`. CTRLRun's own `?ctrlrun_schema=` parameter selects the
+  `deny` — reading `CTRLRUN_STORE_URL`. ctrlrun's own `?ctrlrun_schema=` parameter selects the
   schema and is peeled off before the URL reaches the driver.
 
   **It creates nothing and migrates nothing.** A review found the first version doing both: a
@@ -224,7 +1818,7 @@ have recovered or retrying work nothing can.
   a load error:
   - **`controls:`** — a registry of ids, each with a `title` and an optional `source`. An action
     cites some, a rule may narrow or add, and the receipt carries the union of the action's and
-    the **matched rule's** in registry order. **CTRLRun does not interpret a control**: `source:`
+    the **matched rule's** in registry order. **ctrlrun does not interpret a control**: `source:`
     is a string the operator wrote and the registry records and never enforces. It maps to no
     standard, and citing one is not a claim about it.
   - **`data:`** — an action declares which of its arguments carry which class of data.
@@ -267,7 +1861,7 @@ have recovered or retrying work nothing can.
 
   The **reservation is still taken**, and the asymmetry is deliberate: in observe mode the action
   genuinely executes, so the effect record has to exist or the duplicate refusal has nothing to
-  refuse with. Observe mode suppresses CTRLRun's *decisions*; it does not suppress the record of
+  refuse with. Observe mode suppresses ctrlrun's *decisions*; it does not suppress the record of
   an effect that really happened. The `APPROVAL_CONSUMED` event on that path is **gone rather
   than renamed** — v0.6 adds no event type, and an event naming a write that did not happen is
   worse than no event.
@@ -383,7 +1977,7 @@ version line of its own.
 
 `docs/SPEC-scan.md` is the contract; it was written first and its §8 tests were red before any
 of it existed. `scan` reads a Python tree and a policy document and reports the consequential
-call sites and policy entries CTRLRun is not covering — the gap between *installed* and *in the
+call sites and policy entries ctrlrun is not covering — the gap between *installed* and *in the
 path*, which until now had no command.
 
 - **The honest half is the load-bearing half.** A scanner reports what it found where it
@@ -532,7 +2126,7 @@ exercise, not the two adapters, is what v0.5 is for.
 Three independent reviews and item 6 found five authorization defects in
 `ctrlrun-openai-agents` before it shipped. All are fixed, mutation-tested, and recorded here
 because the pattern matters more than any one of them: **the SDK's approval record is keyed to a
-tool call, and a CTRLRun grant binds to an action hash**, so every defect was the same shape —
+tool call, and a ctrlrun grant binds to an action hash**, so every defect was the same shape —
 reading a coarser answer as though it answered a finer question.
 
 - `interrupt()` returned `granted=True` unconditionally.
@@ -544,7 +2138,7 @@ reading a coarser answer as though it answered a finer question.
   masked an AMBIGUOUS refund — *safe to retry* reported for an effect that may have landed.
 - **Observe mode interrupted and blocked the action.** Found by item 6 without reading the
   adapter. §3.6's rule followed for one framework shape and had to be *required* of the other;
-  a deployment evaluating CTRLRun in the mode built for evaluating it would have had its agent
+  a deployment evaluating ctrlrun in the mode built for evaluating it would have had its agent
   halted.
 
 ### Added
@@ -609,7 +2203,7 @@ reading a coarser answer as though it answered a finer question.
 
 ## [0.4.0] - 2026-09-04
 
-**Does it hold in *your* setup?** Everything CTRLRun guarantees was proven, until now, by this
+**Does it hold in *your* setup?** Everything ctrlrun guarantees was proven, until now, by this
 repository's tests against this repository's configurations. That is the right place to start
 and the wrong place to stop: what an operator deploys is *their* policy, *their* grants and
 *their* store, and a guarantee that has never been exercised against those is a guarantee
@@ -693,7 +2287,7 @@ than to storage: `ctrlrun.verify/v1`, `ctrlrun.guarantees/v1` and `ctrlrun.frame
   would need `contents: write` in every consumer's workflow, and asking for write access to a
   repository as the price of a verification badge is a bad trade for a tool whose subject is
   least privilege; `docs/docs/verify.md` shows the one-job publishing pattern once, with its cost
-  visible. Rendered, it reads exactly `CTRLRun verified N/M`, where `M` is **applicable**
+  visible. Rendered, it reads exactly `ctrlrun verified N/M`, where `M` is **applicable**
   guarantees and never the catalogue size. A partial run and a run that exited 2 or 3 write no
   badge at all.
 
@@ -711,13 +2305,13 @@ than to storage: `ctrlrun.verify/v1`, `ctrlrun.guarantees/v1` and `ctrlrun.frame
 - **`docs/docs/OWASP-AGENTIC-TOP10.md`** (SPEC-v0.4 §6) — a reading of the OWASP Top 10 for Agentic
   Applications (2026 edition, announced 2025-12-09) against the ten guarantees. Its first line,
   before any table, says what it is not: not a compliance claim, not a conformance claim, not a
-  certification, and not a statement that CTRLRun covers the Top 10.
+  certification, and not a statement that ctrlrun covers the Top 10.
 
   Two tables, and the second is what makes the first credible. `ASI04` supply chain, `ASI05`
-  code execution and `ASI06` memory and context poisoning are **not CTRLRun's subject** —
+  code execution and `ASI06` memory and context poisoning are **not ctrlrun's subject** —
   nothing here inspects a package, sandboxes an interpreter or reads a model's memory — and
   `ASI07` inter-agent communication waits on v0.7. `ASI01` agent goal hijack and `ASI09`
-  human-agent trust exploitation appear in **both** tables, because CTRLRun constrains what a
+  human-agent trust exploitation appear in **both** tables, because ctrlrun constrains what a
   hijacked agent can do without detecting the hijack, and binds an approval to one action
   without authenticating the approver or noticing that they were misled.
 
@@ -786,7 +2380,7 @@ than to storage: `ctrlrun.verify/v1`, `ctrlrun.guarantees/v1` and `ctrlrun.frame
 
 - **`docs/SPEC-v0.4.md`** — the v0.4 contract, a delta over v0.1, v0.2 and v0.3. v0.4 answers
   the question the first three releases could not: *does it hold in **my** setup?* Everything
-  CTRLRun guarantees is proven today by this repository's tests against this repository's
+  ctrlrun guarantees is proven today by this repository's tests against this repository's
   configurations, which is the right place to start and the wrong place to stop.
   `ctrlrun verify` runs those failure scenarios against the operator's own policy, grants and
   store type, and reports what passed, what failed, and what could not be tested at all.
@@ -823,7 +2417,7 @@ no half-way and no flag that makes a missing grant permissive.
 its parent, on every dimension, at creation *and* at every evaluation. Omission never means
 unlimited: a child that drops a dimension its parent constrains is rejected.
 
-**Identity is consumed, not invented.** CTRLRun verifies tokens it is handed and maps verified
+**Identity is consumed, not invented.** ctrlrun verifies tokens it is handed and maps verified
 claims onto a `Principal`. It issues nothing and defines no identity format. Claims are receipt
 data rather than action identity — they are not in the canonical form, so an approval survives
 a token rotation.
@@ -964,7 +2558,7 @@ a token rotation.
 - **Observe mode still refuses what it cannot describe.** A missing principal, a provider that
   raises, an unresolvable effect key, an argument an Action cannot represent, and a delegation
   that would escalate are refused in both modes: the first four are wiring bugs that would run
-  an action CTRLRun could not describe, and the fifth is an act of authority rather than a
+  an action ctrlrun could not describe, and the fifth is an act of authority rather than a
   decision about an action. It asks no human either — a policy reaching `approve` records
   `approval_required` and runs, creating no request and appending no `APPROVAL_REQUESTED` —
   and it never calls the `reconcile` hook, whose `"committed"` answer would move a record a
@@ -1114,7 +2708,7 @@ a token rotation.
   authority that decision picks the principal.
 - **BREAKING for a reader: `ReceiptResult` gains `observed`.** `Receipt.from_dict` parses
   `result` into a closed `StrEnum` and `SQLiteStateStore` reads every stored receipt through
-  it, so a CTRLRun ≤ 0.2 process running `ctrlrun receipts` or `ctrlrun inspect` against a
+  it, so a ctrlrun ≤ 0.2 process running `ctrlrun receipts` or `ctrlrun inspect` against a
   store an 0.3 **observe-mode** process wrote raises on the unknown value. Two processes
   sharing one store is the intended deployment: **upgrade every reader before switching any
   writer to `mode: observe`.** An enforce-mode 0.3 writer emits no `observed` receipt and is
@@ -1232,8 +2826,8 @@ reconstruct:
   parser: `parseInt("2_000")` is 2 in JavaScript and `strconv.Atoi` errors in Go.
 
   That is the exact hazard SPEC-v0.2 §6.4 exists to prevent. The gateway's job there is to
-  certify that a routing intermediary and CTRLRun are looking at the same value, and it was
-  certifying agreement that held only under Python's rules. CTRLRun's own decisions were never
+  certify that a routing intermediary and ctrlrun are looking at the same value, and it was
+  certifying agreement that held only under Python's rules. ctrlrun's own decisions were never
   affected — the action is built from the body, and the headers are only checked — so this
   costs an intermediary's correctness rather than an approval binding.
 
@@ -1241,7 +2835,7 @@ reconstruct:
   parser in the comparison — and only a string, an integer or a boolean has one. The revision
   permits `x-mcp-header` on those three types alone and omits the header for a `null`, so a
   header naming an argument of any other type is refused rather than compared against a
-  rendering CTRLRun invented for it. This also declines the revision's SHOULD that servers compare
+  rendering ctrlrun invented for it. This also declines the revision's SHOULD that servers compare
   integers numerically (`42.0` equals `42`): v0.1 §2.3 refuses a float in the body outright, so
   the leniency has no legitimate case here. SPEC-v0.2 §6.4 states both rules and the reasoning.
 
@@ -1253,7 +2847,7 @@ Everything below ships. `pip install ctrlrun` still installs nothing but `pyyaml
 ### Added
 
 - **MCP gateway** — `ctrlrun gateway --upstream <url> --alias <name>`, in `ctrlrun[gateway]`.
-  An existing MCP tool server gets CTRLRun semantics with no agent changes: `tools/call`
+  An existing MCP tool server gets ctrlrun semantics with no agent changes: `tools/call`
   becomes an Action, everything else is relayed unchanged. The request forwarded upstream is
   built from the action's *canonical* arguments, so what was hashed, reserved and recorded is
   byte-for-byte what the tool receives. Serves `2026-07-28` and `2025-03-26`–`2025-11-25` in
@@ -1353,7 +2947,7 @@ Everything below ships. `pip install ctrlrun` still installs nothing but `pyyaml
   `schema: ctrlrun.policy/v2`. `ctrlrun.policy/v1` files keep loading unchanged; a `v2` file
   will not load on 0.1.0, which is the point — 0.1.0 would ignore the effect template and
   execute with no duplicate protection.
-- MCP tool arguments that CTRLRun cannot canonicalize — any JSON number with a fraction — will
+- MCP tool arguments that ctrlrun cannot canonicalize — any JSON number with a fraction — will
   be refused by the gateway, never rounded or coerced. Tools that move money through the
   gateway need integer minor units or decimal strings in their schema.
 

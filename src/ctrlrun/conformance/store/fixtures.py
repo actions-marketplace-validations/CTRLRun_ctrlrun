@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """The broken-store fixtures. SPEC-v0.6 §2.6.
 
 **A suite that only ever passes is a suite nothing exercises.** Each store here is broken in one
@@ -22,7 +24,7 @@ import shutil
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +32,7 @@ from ...action import Action
 from ...effect import DEFAULT_LEASE, EffectRecord, EffectState, Reservation
 from ...errors import NotExecuted
 from ...receipt import Event
-from ...state import DelegationRecord, StateStore
+from ...state import Charge, ClockSkew, DelegationRecord, StateStore
 from .backends import SQLiteBackend, StoreBackend
 
 
@@ -87,7 +89,11 @@ class _TwoWinners(_Wrapped):
     """Drops the uniqueness check: every contender reserves."""
 
     def reserve_effect(
-        self, effect_key: str, action_id: str, lease: timedelta = DEFAULT_LEASE
+        self,
+        effect_key: str,
+        action_id: str,
+        lease: timedelta = DEFAULT_LEASE,
+        charges: tuple[Charge, ...] = (),
     ) -> Reservation:
         now = datetime.now(tz=None).astimezone()
         return Reservation(
@@ -100,7 +106,11 @@ class _ReleasesAnExpiredLease(_Wrapped):
     `AMBIGUOUS` and refusing (`v0.1 §5.3 E3`)."""
 
     def reserve_effect(
-        self, effect_key: str, action_id: str, lease: timedelta = DEFAULT_LEASE
+        self,
+        effect_key: str,
+        action_id: str,
+        lease: timedelta = DEFAULT_LEASE,
+        charges: tuple[Charge, ...] = (),
     ) -> Reservation:
         record = self._inner.get_effect(effect_key)
         if record is not None and record.lease_expires_at is not None:
@@ -126,7 +136,11 @@ class _RefusesWithTheWrongError(_Wrapped):
     """
 
     def reserve_effect(
-        self, effect_key: str, action_id: str, lease: timedelta = DEFAULT_LEASE
+        self,
+        effect_key: str,
+        action_id: str,
+        lease: timedelta = DEFAULT_LEASE,
+        charges: tuple[Charge, ...] = (),
     ) -> Reservation:
         try:
             return self._inner.reserve_effect(effect_key, action_id, lease)
@@ -158,9 +172,10 @@ class _ConsumesBeforeReserving(_Wrapped):
         effect_key: str,
         action_id: str,
         lease: timedelta = DEFAULT_LEASE,
+        charges: tuple[Charge, ...] = (),
     ) -> Any:
         approval = self._inner.consume_approval(approval_id, action_hash)
-        reservation = self._inner.reserve_effect(effect_key, action_id, lease)
+        reservation = self._inner.reserve_effect(effect_key, action_id, lease, charges)
         return approval, reservation
 
 
@@ -274,7 +289,11 @@ class _KeepsTheResolverAcrossARetry(_Wrapped):
         self._resolvers = {}
 
     def reserve_effect(
-        self, effect_key: str, action_id: str, lease: timedelta = DEFAULT_LEASE
+        self,
+        effect_key: str,
+        action_id: str,
+        lease: timedelta = DEFAULT_LEASE,
+        charges: tuple[Charge, ...] = (),
     ) -> Reservation:
         before = self._inner.get_effect(effect_key)
         reservation = self._inner.reserve_effect(effect_key, action_id, lease)
@@ -317,6 +336,25 @@ class _CoercesAnArgument(_Wrapped):
             environment=record.request.action.environment,
         )
         return replace(record, request=replace(record.request, action=action))
+
+
+class _DropsThePreconditionFingerprint(_Wrapped):
+    """Reads every approval back without its precondition fingerprint (SPEC-v0.7 §6.4, T266).
+
+    What a backend that never added `0005`'s column, or a restore from before it, looks like
+    from above: the request went in with a fingerprint and comes out with none.
+    """
+
+    def get_approval(self, approval_id: str) -> Any:
+        record = self._inner.get_approval(approval_id)
+        return None if record is None else _without_fingerprint(record)
+
+    def approvals_for(self, action_hash: str) -> Any:
+        return tuple(_without_fingerprint(r) for r in self._inner.approvals_for(action_hash))
+
+
+def _without_fingerprint(record: Any) -> Any:
+    return replace(record, request=replace(record.request, precondition_fingerprint=None))
 
 
 class _RenumbersEvents(_Wrapped):
@@ -362,6 +400,68 @@ class _UpsertsADelegation(_Wrapped):
             connection.commit()
             return None
         self._inner.put_delegation(record)
+
+
+# --- clock (SPEC-v0.7 §8 T214) ---------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _ClockSkewLookAlike:
+    """Every field `ClockSkew` has, and not `ClockSkew`. `Control` ignores it by design."""
+
+    skew: timedelta
+    bound: timedelta
+    threshold: timedelta
+    measured_at: datetime
+    trigger: str
+
+    @property
+    def exceeded(self) -> bool:
+        return abs(self.skew) > self.threshold + self.bound
+
+
+class _SkewLookAlike(_Wrapped):
+    """Exposes its measurement as a look-alike type rather than `ctrlrun.state.ClockSkew`."""
+
+    @property
+    def clock_skew(self) -> Any:
+        return _ClockSkewLookAlike(
+            timedelta(seconds=30), timedelta(0), timedelta(seconds=1), datetime.now(UTC), "open"
+        )
+
+
+class _SkewReadRaises(_Wrapped):
+    """Exposes the attribute, and reading it raises."""
+
+    @property
+    def clock_skew(self) -> ClockSkew | None:
+        raise RuntimeError("the measurement could not be read")
+
+
+def _pinned(skew: timedelta) -> ClockSkew:
+    return ClockSkew(
+        skew=skew,
+        bound=timedelta(0),
+        threshold=timedelta(seconds=1),
+        measured_at=datetime.now(UTC),
+        trigger="open",
+    )
+
+
+class _SkewNeverReported(_Wrapped):
+    """A detector that never fires: every measurement says the clocks agree."""
+
+    @property
+    def clock_skew(self) -> ClockSkew | None:
+        return _pinned(timedelta(0))
+
+
+class _SkewAlwaysReported(_Wrapped):
+    """A detector that always fires: every measurement says the clocks are an hour apart."""
+
+    @property
+    def clock_skew(self) -> ClockSkew | None:
+        return _pinned(timedelta(hours=1))
 
 
 # --- the declarations ------------------------------------------------------------------------
@@ -534,6 +634,12 @@ FIXTURES: Sequence[Fixture] = (
         because="the action hash changed across the store",
     ),
     Fixture(
+        "drops-the-precondition-fingerprint",
+        {"approval": "precondition-fingerprint"},
+        _wrapping("drops-the-precondition-fingerprint", _DropsThePreconditionFingerprint),
+        because="precondition_fingerprint came back None",
+    ),
+    Fixture(
         "renumbers-events",
         {"evidence": "event-ids"},
         _wrapping("renumbers-events", _RenumbersEvents),
@@ -550,6 +656,30 @@ FIXTURES: Sequence[Fixture] = (
         {"delegation": "insert-not-upsert"},
         _wrapping("upserts-a-delegation", _UpsertsADelegation),
         because="upserted on a duplicate id",
+    ),
+    Fixture(
+        "skew-look-alike",
+        {"clock": "skew-measured"},
+        _wrapping("skew-look-alike", _SkewLookAlike),
+        because="not a ctrlrun.state.ClockSkew",
+    ),
+    Fixture(
+        "skew-read-raises",
+        {"clock": "skew-measured"},
+        _wrapping("skew-read-raises", _SkewReadRaises),
+        because="reading clock_skew raised",
+    ),
+    Fixture(
+        "skew-never-reported",
+        {"clock": "skew-measured"},
+        _wrapping("skew-never-reported", _SkewNeverReported),
+        because="was not reported",
+    ),
+    Fixture(
+        "skew-always-reported",
+        {"clock": "skew-measured"},
+        _wrapping("skew-always-reported", _SkewAlwaysReported),
+        because="aligned with the store's was reported",
     ),
     Fixture(
         "falsely-declares-no-url",

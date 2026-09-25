@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """Observe mode and `ctrlrun stats`. Build-list item 4; SPEC-v0.3 §6.
 
 The acceptance tests are T82 to T87. Four sentences run through all of them:
@@ -53,6 +55,7 @@ from ctrlrun.receipt import (
     BLOCKED_APPROVAL_REQUIRED,
     BLOCKED_DUPLICATE,
     BLOCKED_IN_PROGRESS,
+    RECEIPT_SCHEMA,
     Receipt,
     ReceiptResult,
 )
@@ -206,7 +209,7 @@ def test_T82_the_observed_receipt_round_trips_through_json(store, clock):
     )
     document = json.loads(receipt.to_json())
 
-    assert document["schema"] == "ctrlrun.receipt/v3"
+    assert document["schema"] == RECEIPT_SCHEMA
     assert document["result"] == "observed"
     assert document["execution"] == "committed"
     assert document["would_have"]["decision"] == "deny"

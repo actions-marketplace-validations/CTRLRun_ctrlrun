@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """The gateway in the execution path. Build-list item 6c; SPEC-v0.2 §6.1, §6.3, §6.5-§6.10.
 
 Acceptance tests T19, T21, T22, T23, T25, and the end-to-end halves of T20 and T24 that
@@ -224,7 +226,7 @@ def test_T19_the_action_is_named_for_the_alias_and_the_tool(client, upstream, st
 
 
 def test_T19_the_response_carries_the_ctrlrun_receipt_meta(client, upstream, store):
-    """§6.8 — so a client is not left guessing what CTRLRun recorded."""
+    """§6.8 — so a client is not left guessing what ctrlrun recorded."""
     upstream.respond({"resultType": "complete", "content": []})
 
     response = _post(client)
@@ -690,6 +692,30 @@ def test_T25_an_action_needing_a_human_returns_41002_and_writes_no_receipt(clien
     assert _error(response)["data"]["request_id"].startswith("apr_")
     assert store.receipts() == ()
     assert upstream.calls == []
+
+
+def test_the_41002_message_tells_an_mcp_client_what_an_mcp_client_can_do(client, upstream, store):
+    """The error text is read by a client that is not Python, and often by a model.
+
+    `ApprovalRequired` carries the decorator's wording -- *run `ctrlrun approve …`, then retry
+    inside `ctrlrun.with_approval(…)`* -- and the gateway used to relay `str(exc)` verbatim. That
+    told an MCP client to enter a Python context manager it has no access to, on the one path
+    where the caller may be in any language. `gateway-in-5-minutes.mdx` documents the real next
+    step and the gateway now says it: a human approves, and the same call runs again.
+
+    Asserting the absence of `with_approval` is the half that matters. A message merely
+    *mentioning* the retry would pass a positive-only check while still sending a Go client
+    looking for a Python API.
+    """
+    body = _needs_approval()
+
+    response = client.post("/mcp", content=json.dumps(body).encode(), headers=_headers(body))
+    message = _error(response)["message"]
+
+    assert "with_approval" not in message, message
+    assert "ctrlrun approve" in message, message
+    assert "this same call runs" in message, message
+    assert _error(response)["data"]["request_id"] in message, message
 
 
 def test_T25_the_identical_call_executes_once_the_approval_is_granted(client, upstream, store):
@@ -2064,3 +2090,123 @@ def test_a_refused_path_does_not_desynchronise_the_connection(gateway, path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+BUDGETED_AUTHORITY = """
+schema: ctrlrun.policy/v7
+authority:
+  grants:
+    - id: refunder
+      subject: { agent: "refund-agent" }
+      actions: ["mcp.acme.create_refund"]
+      resources: ["payment:*"]
+      constraints: { amount_lte: 20000 }
+      budgets:
+        - { metric: units, limit: 100, window: PT24H }
+"""
+
+
+@pytest.fixture
+def budgeted_client(upstream, store):
+    """A grant budgeting a metric the tool's arguments do not carry (SPEC-v0.9 §2.3)."""
+    from ctrlrun import Authority
+
+    policy = Policy.from_yaml(POLICY.replace("ctrlrun.policy/v2", "ctrlrun.policy/v7"))
+    control = Control(
+        policy, store, authority=Authority.from_yaml(BUDGETED_AUTHORITY, standalone=True)
+    )
+    config = GatewayConfig(upstream=upstream.url, alias="acme", principal_header="X-Agent", port=0)
+    forwarder = httpx_forwarder(config)
+    gateway = Gateway(config, control, forwarder)
+    server = build_server(gateway)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=10) as opened:
+        yield opened
+    server.shutdown()
+    server.server_close()
+    forwarder.close()
+
+
+@pytest.mark.authority
+def test_an_unmeasurable_budget_is_answered_and_never_dropped(budgeted_client, upstream, store):
+    """**A dropped connection is the one thing this gateway may not do** (SPEC-v0.9 §2.3).
+
+    §2.3's refusal is an `InvalidArgument`, and `_through_control` catches eight exception types
+    and not that one, so the handler raised out of the request and the socket closed with no
+    response. An independent review found it: the client sees
+    `RemoteProtocolError: Server disconnected without sending a response`, and a client that
+    retries blindly gets nothing while the store accumulates one `ACTION_DENIED` and one `denied`
+    receipt per attempt.
+
+    The refusal is a decision about an action, so it is answered like one: `-41001`, the code
+    §11 already freezes for "not permitted to anyone in this configuration", which is exactly
+    what an action the kernel cannot measure is.
+    """
+    response = _post(
+        budgeted_client,
+        _call(arguments={"amount": 10000, "payment_id": "pi_1"}),
+        headers={"X-Agent": "refund-agent"},
+    )
+
+    assert upstream.calls == [], "fail closed: the upstream must not run"
+    body = response.json()
+    assert body["error"]["code"] == -41001, body
+    assert body["error"]["data"]["reason"] == "budget_unmeasurable", body
+    assert [str(event.type) for event in store.events()][-1] == "ACTION_DENIED"
+    assert store.receipts()[-1].decision_reason == "budget_unmeasurable"
+
+
+@pytest.mark.authority
+def test_a_retry_of_an_unmeasurable_call_is_answered_every_time(budgeted_client, upstream, store):
+    """The half that makes the drop expensive rather than merely wrong: a client retrying a
+    dropped socket gets an answer each time instead of nothing."""
+    for _ in range(3):
+        response = _post(
+            budgeted_client,
+            _call(arguments={"amount": 10000, "payment_id": "pi_1"}),
+            headers={"X-Agent": "refund-agent"},
+        )
+        assert response.json()["error"]["code"] == -41001
+    assert upstream.calls == []
+
+
+def test_T480_a_metadata_agent_id_decides_nothing_and_the_provider_s_principal_decides(
+    client, upstream, store
+):
+    """SPEC-v0.10 §3.1.2 end to end, and `v0.3`'s T91d at the hop.
+
+    `params.metadata` is the caller's own JSON, and it is where a hop arrives. The parser half of
+    this is in `test_mcp.py`; this is the half that matters to an operator reading evidence: the
+    receipt names the principal the `IdentityProvider` resolved from `X-Agent`, and the name the
+    payload asked for appears **nowhere** in it.
+
+    An agent that could pick its own principal by typing one would defeat every authority decision
+    downstream, because authority matches on the subject.
+    """
+    upstream.respond({"resultType": "complete", "content": []})
+    body = _call()
+    body["params"]["metadata"] = {
+        "agent_id": "treasury-admin",
+        "principal": "treasury-admin",
+        "user": "root@example.com",
+        "task": "refund-run:7",
+    }
+
+    response = client.post(
+        "/mcp", content=json.dumps(body).encode(), headers=_headers(body_call=body)
+    )
+
+    assert response.status_code == 200, response.text
+    receipt = store.receipts()[-1]
+    assert receipt.principal.agent == "refund-agent", (
+        "the payload named the acting principal; X-Agent is the only thing that may"
+    )
+    assert receipt.principal.user != "root@example.com"
+    # And nowhere else in the evidence either -- not in the receipt, not in the events.
+    rendered = json.dumps(receipt.to_dict()) + json.dumps(
+        [event.data for event in store.events()], default=str
+    )
+    assert "treasury-admin" not in rendered, "a payload-chosen name reached the evidence log"
+    assert "root@example.com" not in rendered, rendered

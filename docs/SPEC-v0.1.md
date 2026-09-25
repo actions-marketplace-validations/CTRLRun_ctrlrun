@@ -1,4 +1,4 @@
-# CTRLRun v0.1 Specification
+# ctrlrun v0.1 Specification
 
 This is the contract for v0.1. Tests are derived from §7. Public names are frozen in §8. Anything not in this document is out of scope for v0.1.
 
@@ -336,6 +336,15 @@ When a new action arrives for an `effect_key` that already has a record:
 
 `FAILED` means the executor *proved* nothing happened (§5.5). That is the only state that permits automatic retry.
 
+**Amendment (v0.7, `SPEC-v0.7.md` §5).** The `FAILED` row is bounded where the action's policy entry declares `max_attempts` (`schema: ctrlrun.policy/v5`): at most `max_attempts` attempts execute on one effect key, the first included.
+
+| Existing state | New reservation | Raised |
+|---|---|---|
+| `FAILED` at attempt *n*, and no `max_attempts`, or *n* + 1 ≤ `max_attempts` | allowed: attempt *n* + 1, same key | none |
+| `FAILED` at attempt *n*, and *n* + 1 > `max_attempts` | refused. Where the record is read before the approval gate, nothing is written. Otherwise the store assigns attempt *n* + 1, and the record is released as `FAILED` without the executor being called | `ActionDenied(reason="attempt_ceiling")` |
+
+The decision is taken on the attempt number the store assigned to the reservation, after the reservation and before the executor; a read of the record before the approval gate may refuse the same renewal earlier and is never the only check. The refusal appends `EFFECT_RESERVATION_REFUSED` with `data.reason = "attempt_ceiling"` and writes a `blocked` receipt. `FAILED` is still the only state that permits an automatic retry: the ceiling removes permission from that row and grants none to any other.
+
 ### 5.5 Executor outcome mapping
 
 The wrapped function is the executor. Its result is mapped:
@@ -394,7 +403,7 @@ An action awaiting approval has no receipt; `APPROVAL_REQUESTED` is its evidence
 
 **When only one of the two writes succeeds.** SQLite is authoritative and the JSONL file is a convenience export of what it already holds, so the store is written first and the file second. A failed file write MUST be logged on the `ctrlrun` logger and MUST NOT be raised. By the time it runs, the effect has committed at the remote and the record is durable; raising there would reach the caller as an exception on a successful action, and an agent that reads it as a failure retries — which is the one mistake this library exists to prevent. Nothing is hidden by the loss: `ctrlrun receipts` and `ctrlrun effects` read the database, not the files. The reverse order is not available: a store that refuses the write has not recorded the action, and there is nothing to export.
 
-Enums MUST render by value everywhere evidence is produced — receipt JSON, event `data`, and CLI output: `"approve"`, never `"Decision.APPROVE"`. This is why `Decision` (§3.3) and `EffectState` (§5.2) are `StrEnum`; the guard is `test_decision_renders_by_value` in `tests/test_policy.py`, which pins `str()` and f-string interpolation. A receipt is read by tools that never imported CTRLRun.
+Enums MUST render by value everywhere evidence is produced — receipt JSON, event `data`, and CLI output: `"approve"`, never `"Decision.APPROVE"`. This is why `Decision` (§3.3) and `EffectState` (§5.2) are `StrEnum`; the guard is `test_decision_renders_by_value` in `tests/test_policy.py`, which pins `str()` and f-string interpolation. A receipt is read by tools that never imported ctrlrun.
 
 ### 6.2 Events
 

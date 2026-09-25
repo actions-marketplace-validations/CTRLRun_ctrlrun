@@ -1,5 +1,7 @@
-# Extracted by tools/docs_audit/render_cookbook.py from
-# docs/docs/cookbook/customer-notification-agent.mdx — edit the page, never this file.
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
+# Extracted by CTRLRun/ctrlrun-docs tools/docs_audit/render_cookbook.py from
+# docs/cookbook/customer-notification-agent.mdx — edit the page, never this file.
 from pathlib import Path
 
 import ctrlrun

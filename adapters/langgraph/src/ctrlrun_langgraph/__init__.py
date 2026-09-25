@@ -1,4 +1,6 @@
-"""Route a CTRLRun `APPROVE` through LangGraph's own `interrupt()`. SPEC-v0.5 §2, §3.
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Route a ctrlrun `APPROVE` through LangGraph's own `interrupt()`. SPEC-v0.5 §2, §3.
 
 **An adapter exists for exactly one reason**, and this is the whole of it: when a policy says a
 refund needs a human, the human answers *where LangGraph users already answer* — through
@@ -15,7 +17,7 @@ including a LangChain tool and a raw model call, with no adapter and no framewor
 buys one thing over it: the interrupt. If your graph has nowhere for a human to answer, or you
 are happy for `ApprovalRequired` to reach your own code, use `@protect` and stop here.
 
-Supported kernel range: `ctrlrun>=0.5,<0.7`. Supported framework range: `langgraph>=1.0,<2.0`.
+Supported kernel range: `ctrlrun>=0.5,<0.13`. Supported framework range: `langgraph>=1.0,<2.0`.
 `README.md` states both, and what this adapter's binding check is and is not.
 """
 

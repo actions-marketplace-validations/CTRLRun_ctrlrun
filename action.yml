@@ -1,7 +1,7 @@
-name: CTRLRun verify
+name: ctrlrun verify
 description: >-
-  Run CTRLRun's declared guarantees against your policy and grants, and report what passed, failed, or was not applicable.
-author: CTRLRun
+  Run ctrlrun's declared guarantees against your policy and grants, and report what passed, failed, or was not applicable.
+author: ctrlrun
 
 branding:
   icon: shield
@@ -49,7 +49,7 @@ inputs:
     description: >-
       Where to write the Shields endpoint JSON. The action writes it and never publishes it:
       publishing is your decision, in your own workflow, with whatever permissions you choose
-      (SPEC-v0.4 §5.2, `docs/docs/verify.md`).
+      (SPEC-v0.4 §5.2, `https://ctrlrun.dev/docs/verify`).
     required: false
     default: verify-badge.json
   upload-artifact:
@@ -88,7 +88,7 @@ runs:
       with:
         python-version: ${{ inputs.python-version }}
 
-    - name: Install CTRLRun
+    - name: Install ctrlrun
       shell: bash
       env:
         CTRLRUN_INSTALL: ${{ inputs.install }}
@@ -127,7 +127,7 @@ runs:
           # Exit 2 and exit 3 print to stderr and write no document. There is nothing to
           # render, no badge to write, and the job fails below.
           {
-            echo "### CTRLRun verify"
+            echo "### ctrlrun verify"
             echo
             echo "The configuration was refused, or verify failed internally"
             echo "(exit \`$status\`). No report was produced and no badge was written."

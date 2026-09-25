@@ -1,12 +1,16 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """Receipts on disk, the CLI and `ctrlrun demo`. SPEC-v0.1 §6, §8; acceptance tests T10, T11.
 
-The JSONL evidence is the half of §6 a reader outside CTRLRun ever sees, so these tests read
+The JSONL evidence is the half of §6 a reader outside ctrlrun ever sees, so these tests read
 the files rather than the store wherever the spec names a file.
 """
 
 import json
 import os
 import re
+import subprocess
+import sys
 import time
 from dataclasses import replace
 from fnmatch import fnmatch
@@ -97,6 +101,20 @@ SPEC_RECEIPT_FIELDS = (
     "policy_hash",
     "policy_version",
     "controls",
+    # SPEC-v0.7 §6.11: `ctrlrun.receipt/v4`. Fingerprints, never the state they hash.
+    "precondition_at_request",
+    "precondition_at_recheck",
+    # SPEC-v0.8 §11.3: `ctrlrun.receipt/v5` adds the two.
+    "approvers",
+    "authority_grant_id",
+    # SPEC-v0.9 §6, a `ctrlrun.receipt/v6` field.
+    "task",
+    # SPEC-v0.9 §5.5, a `ctrlrun.receipt/v6` field.
+    "scope_hash",
+    # SPEC-v0.9 §10.1, the third `ctrlrun.receipt/v6` field.
+    "budget_charges",
+    # SPEC-v0.10 §3.5, the one `ctrlrun.receipt/v7` field.
+    "hop",
 )
 
 
@@ -543,6 +561,42 @@ def test_T11_demo_runs_in_under_sixty_seconds(demo_run):
     assert elapsed < 60
 
 
+def test_T271_demo_runs_offline_in_a_process_with_the_network_taken_away(tmp_path, no_network):
+    """The definition of done says *under 60 seconds with no network*, and the fixture above
+    cannot show it: it runs in this process, through `CliRunner`, where nothing has been taken
+    away. "Runs with no network" stays a claim until something takes the network away
+    (`CONTRIBUTING.md`), so this runs the installed console script in a subprocess whose
+    `sitecustomize` is `conftest.py`'s one guard, the same one T107, T230, the examples and the
+    cookbook use.
+
+    The guard admits exactly what `SPEC-v0.7.md` §8.9 admits and nothing more: an IPv4 connect
+    to the `127.0.0.1` literal at a port this process bound through a stream socket that is
+    still open. The demo binds none, so it reaches nothing at all, and a demo that grew a
+    fetch would fail here rather than in a reader's terminal.
+    """
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(no_network), environment.get("PYTHONPATH", "")) if part
+    )
+
+    started = time.monotonic()
+    finished = subprocess.run(
+        [sys.executable, "-c", "from ctrlrun.cli.main import main; main()", "demo"],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    elapsed = time.monotonic() - started
+
+    assert finished.returncode == 0, f"{finished.stdout}\n{finished.stderr}"
+    assert elapsed < 60, f"the demo took {elapsed:.1f}s with the network taken away"
+    for number, heading in enumerate(SCENARIO_HEADINGS, start=1):
+        assert f"{number}. {heading}" in finished.stdout
+    assert "runs with no network" not in finished.stderr
+
+
 def test_T93_demo_prints_all_five_scenario_headings(demo_run):
     result, _, _ = demo_run
 
@@ -698,12 +752,19 @@ def test_a_path_outside_the_run_directory_is_printed_whole(tmp_path):
 _RUN_VARYING = re.compile(r"(?:apr|dlg)_[0-9a-f]+")
 
 
+#: The transcript moved into a collapsed block when the README was cut to three questions on
+#: 2026-09-09. The guard did not move: every line the demo prints is still quoted there, and a
+#: missing block is a failure rather than an empty string that would pass this vacuously.
+_DEMO_BLOCK_ANCHOR = "<summary>What <code>ctrlrun demo</code> shows"
+
+
 def _readme_demo_section() -> str:
     readme = Path(__file__).resolve().parents[1] / "README.md"
     if not readme.exists():  # installed without the source tree
         pytest.skip("no repository checkout")
-    section = readme.read_text(encoding="utf-8").split("## What `ctrlrun demo` shows")[1]
-    return section.split("\n## ")[0]
+    text = readme.read_text(encoding="utf-8")
+    assert _DEMO_BLOCK_ANCHOR in text, "the README no longer carries the demo transcript"
+    return text.split(_DEMO_BLOCK_ANCHOR, 1)[1].split("</details>", 1)[0]
 
 
 def test_the_readme_demo_section_quotes_the_demo_output_verbatim(demo_run):
@@ -1044,6 +1105,9 @@ def test_the_cli_offers_exactly_the_commands_the_spec_freezes():
         # SPEC-v0.3 §5.7 — build-list item 3.
         "delegate",
         "revoke",
+        # SPEC-v0.8 §8.3 — a policy change is an action, so proposing one is a command. No
+        # `policy approve`: that is `ctrlrun approve`.
+        "policy",
         # SPEC-v0.3 §6.4, §6.5 — build-list item 4.
         "stats",
         "verify",
@@ -1053,6 +1117,18 @@ def test_the_cli_offers_exactly_the_commands_the_spec_freezes():
         # SPEC-scan.md §9.4. The same shape and for the same reason: a subcommand that adds no
         # table, column, event, error or policy key, on its own no version line.
         "scan",
+        # SPEC-v0.11 §9. An anchor is made on a schedule **by an operator**, where every other
+        # surface in this kernel is a library call made by an agent, so it is a command rather
+        # than a parameter. §11 keeps the management plane off the roadmap and this is not one:
+        # it writes rows and prints lines, and it decides nothing.
+        "anchor",
+        # SPEC-v0.11 §4.2, §9. A prune is an operator's act at the CLI and is deliberately NOT
+        # routed through `Control.execute`: the gate there refuses every action but one on a
+        # deployment that has not approved its current policy, and a store that cannot prune is
+        # a store that fills.
+        "prune",
+        # A group: `place`, `release` and `list`.
+        "hold",
     }
 
 

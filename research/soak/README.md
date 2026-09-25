@@ -62,7 +62,7 @@ asserts the rendered table never claims a duration it did not measure.
 One measured run, and the numbers are the numbers:
 
 ```
-CTRLRun soak — postgres (schema soak_968eae6651)
+ctrlrun soak — postgres (schema soak_968eae6651)
   ran            20m 0s (2026-09-05T19:05:37Z → 2026-09-05T19:25:37Z)
   actions        889735
   ambiguous      133393  (133393 explained, 0 unexplained)
@@ -95,7 +95,7 @@ the harness is allowed to decide; the clock is reported and left to a human.
 The throughput figure is a by-product and is not a performance claim. Note in particular what it
 does **not** measure: most of these actions are denied or refused by policy before any receipt is
 written, so it says very little about the one-row head that `SPEC-v0.6.md` §6.3 serializes every
-receipt write on. `docs/docs/postgres.md` describes that ceiling; this run does not size it.
+receipt write on. `https://ctrlrun.dev/docs/postgres` describes that ceiling; this run does not size it.
 
 ## What it does not do
 

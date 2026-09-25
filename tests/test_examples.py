@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """`examples/` and the sector policy templates. Build-list item 2; SPEC-v0.2 §1.1, T31.
 
 Two halves of one promise. The scripts each run the failure they exist to demonstrate and
@@ -40,13 +42,18 @@ SCENARIOS: dict[str, str] = {
 }
 
 #: Directories under `examples/` that are not one of §1.1's failure scenarios: the sector
-#: templates, and item 8's ACS integration example (SPEC-v0.2 §9, `docs/docs/ACS.md`).
+#: templates, and item 8's ACS integration example (SPEC-v0.2 §9, `https://ctrlrun.dev/docs/ACS`).
 NOT_A_SCENARIO = (
     "policies",
     "acs",
     "authority",
     "cookbook",
     "without-an-agent",
+    # SPEC-v0.11 §3 — not a refusal at all. Every §1.1 scenario ends in ctrlrun declining to
+    # act; this one is about reading the record **afterwards**, and nothing in it is refused.
+    # It has its own test below, because what it must print is the bounded claim rather than a
+    # refusal string.
+    "anchored-chain",
     "__pycache__",
 )
 
@@ -112,45 +119,6 @@ COMPLIANCE_WORDS = (
     "conforms to",
     "aligned with",
 )
-
-_REFUSE_EVERY_SOCKET = '''\
-"""Imported by `site` at startup: nothing under examples/ may open a socket."""
-
-import socket
-
-_real = socket.socket
-
-
-class _Refusing(_real):
-    """A socket that exists but will not connect, which is what a cut cable looks like.
-
-    Replacing the *type* with a function breaks anything that subclasses it — `ssl` does —
-    so the refusal goes on the operations instead.
-    """
-
-    def connect(self, *args, **kwargs):
-        raise RuntimeError("an example tried to connect; examples must run with no network")
-
-    def connect_ex(self, *args, **kwargs):
-        raise RuntimeError("an example tried to connect; examples must run with no network")
-
-
-def _refuse(*args, **kwargs):
-    raise RuntimeError("an example tried to resolve a name; examples run with no network")
-
-
-socket.socket = _Refusing
-socket.create_connection = _refuse
-socket.getaddrinfo = _refuse
-'''
-
-
-@pytest.fixture(scope="session")
-def no_network(tmp_path_factory):
-    """A `PYTHONPATH` entry whose `sitecustomize` refuses every socket (SPEC-v0.2 §1.1)."""
-    directory = tmp_path_factory.mktemp("no-network")
-    (directory / "sitecustomize.py").write_text(_REFUSE_EVERY_SOCKET, encoding="utf-8")
-    return directory
 
 
 def _run(scenario: str, cwd: Path, no_network: Path) -> subprocess.CompletedProcess[str]:
@@ -457,12 +425,25 @@ def test_each_authority_example_loads_on_both_axes(path):
 
 @pytest.mark.authority
 @pytest.mark.parametrize("path", _authority_documents(), ids=lambda path: path.stem)
-def test_each_authority_example_declares_v3(path):
-    """§12.1 — `authority:` needs `ctrlrun.policy/v3`, and a reader that ignored the section
-    would run every action with no authority check at all."""
-    from ctrlrun.policy import POLICY_SCHEMA_V3
+def test_each_authority_example_declares_v3_or_later(path):
+    """§12.1 — `authority:` needs at least `ctrlrun.policy/v3`, and a reader that ignored the
+    section would run every action with no authority check at all.
 
-    assert Policy.from_yaml(path.read_text(encoding="utf-8")).schema == POLICY_SCHEMA_V3
+    **At least**, not exactly: `examples/authority/payments.yaml` declares `v6` since v0.8,
+    because it exercises `approver_role` and `approvals_required` -- which the milestone's own
+    definition of done requires of at least one shipped document, so G17 and G19 are not `N/A`
+    on everything this repository ships. Pinning the exact version made that impossible and
+    would have to be relaxed by whichever milestone shipped it.
+    """
+    from ctrlrun.policy import SUPPORTED_SCHEMAS
+
+    schema = Policy.from_yaml(path.read_text(encoding="utf-8")).schema
+    known = list(SUPPORTED_SCHEMAS)
+
+    assert schema in known
+    assert known.index(schema) >= known.index("ctrlrun.policy/v3"), (
+        f"{path.name} declares {schema}, which predates the authority section"
+    )
 
 
 @pytest.mark.authority
@@ -591,4 +572,49 @@ def test_every_action_the_readme_cites_carries_the_decision_it_is_cited_for(row)
         assert column in reachable, (
             f"README puts {action!r} in the {column!r} column of the {stem} row, "
             f"but {stem}.yaml can only decide {sorted(reachable)}"
+        )
+
+
+# --- the anchored chain (SPEC-v0.11 §3) --------------------------------------------------------
+
+
+def test_T539_the_anchored_chain_example_shows_both_halves_and_overclaims_nothing(
+    tmp_path, no_network
+):
+    """`examples/anchored-chain`. SPEC-v0.11 §2.4, and rule 1.
+
+    **Both halves or neither.** An example that only showed the anchor catching a truncation
+    would be an advertisement: the reader has to see that the chain alone reports the same store
+    intact, or the anchor is solving a problem they have no reason to believe in.
+
+    **And it must not overclaim.** This is the first thing in this project a reader could mistake
+    for tamper-proofing, so the script prints what an anchor does *not* prove as plainly as what
+    it does, and this asserts those lines. `CLAIMS.md` uses the same shape: "there is no such
+    claim" is a statement about the environment until something checks it.
+    """
+    done = _run_script(EXAMPLES / "anchored-chain" / "main.py", tmp_path, no_network)
+    assert done.returncode == 0, done.stdout + done.stderr
+    output = done.stdout
+
+    # Half one: the chain alone does not notice, which is SPEC-v0.6 §6.4 by design.
+    assert "the chain says it is intact: True" in output, output
+    # Half two: the anchor does.
+    assert "anchor_broken at seq 4" in output, output
+    assert "the anchor says:              ok=False" in output, output
+
+    # The bounded claim, in the script's own words.
+    for limit in (
+        "an APPEND is not detected",
+        "erased BETWEEN two anchors are not detected",
+        "does not say who wrote any of it",
+        "An anchor is not a signature",
+        "out of scope",
+        "(last anchored seq, current head]",
+    ):
+        assert limit in output, f"the example no longer states its limit {limit!r}:\n{output}"
+
+    # And it claims nothing this project forbids anywhere.
+    for forbidden in ("tamper-proof", "tamperproof", "immutable", "cannot be altered"):
+        assert forbidden not in output.lower(), (
+            f"the example printed {forbidden!r}, which is a claim an anchor does not support"
         )

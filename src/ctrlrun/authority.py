@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """Grants, patterns, containment and evaluation. Build-list item 2; SPEC-v0.3 §4.
 
 Authority is the second axis. Policy answers *how much autonomy does this action have*, and
@@ -30,26 +32,36 @@ import re
 import secrets
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import MappingProxyType
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, cast
 
 from .action import Action, PlainValue, Principal
 from .errors import AuthorityEscalation, IdentityError, InvalidArgument, PolicyError
-from .policy import (
+
+# `grammar.py` and not `policy.py`: SPEC-v0.3 §4.5 requires the two axes to share one condition
+# evaluator, and it now lives below both rather than inside one of them. Importing it from
+# `policy.py` was the last cycle ARCHITECTURE §6 carried an exception for.
+from .grammar import (
     SUPPORTED_SCHEMAS,
     Condition,
     parse_conditions,
     reject_nested_mode,
     require_v3,
+    require_v7,
     strict_load,
 )
-from .policy import _equal as _type_strict_equal
-from .state import DelegationRecord, StateStore
+from .grammar import _equal as _type_strict_equal
+from .state import Charge, DelegationRecord, StateStore
 
 #: SPEC-v0.3 §4.4 — an action name is dotted (`v0.1 §2.1`) and a resource is `type:id`.
 ACTION_SEPARATOR: Final = "."
 RESOURCE_SEPARATOR: Final = ":"
+#: SPEC-v0.9 §6.2 — segment-bounded like a resource, and measured rather than assumed: with a
+#: separator, `invoice-run-*` matches `invoice-run-7` and does **not** reach a nested
+#: `invoice-run-7:step-2`; without one it reaches both. The fail-closed reading is the one where
+#: a pattern an operator wrote for a run does not silently acquire that run's sub-tasks.
+TASK_SEPARATOR: Final = ":"
 
 #: The only spelling for "everything", and one token long so a review can grep for it.
 DEEP_WILDCARD: Final = "**"
@@ -61,6 +73,20 @@ AUTHORITY_ESCALATION: Final = "authority_escalation"
 AUTHORITY_REVOKED: Final = "authority_revoked"
 AUTHORITY_EXPIRED: Final = "authority_expired"
 AUTHORITY_CONSTRAINT: Final = "authority_constraint"
+#: SPEC-v0.9 §6.2 — a grant that names tasks, evaluated against a task it does not name or
+#: against an action carrying none. Its own reason rather than a silent non-match: the
+#: `environments` precedent would put this in `matches_shape`, where a task-bound grant simply
+#: stops matching and the operator gets `no_authority`, indistinguishable from having no grant
+#: at all. `SPEC-v0.8 §5.2` records what that costs: a refusal that does not name its dimension
+#: is the least diagnosable one in the file. G24 asserts this value.
+AUTHORITY_TASK: Final = "authority_task"
+#: SPEC-v0.10 §2.3.2 rule 2 — a hop was presented and does not reach this action: the id names no
+#: delegation, or the one it names does not match the action's shape. Its own reason for the same
+#: argument `AUTHORITY_TASK` makes one line up: without it three of the six refusal shapes report
+#: `no_authority` with no `grant_id` at all (§2.3.3's probe), so the milestone's headline refusal,
+#: "this hop does not authorise this action", is indistinguishable from holding nothing, and §6.3's
+#: promise to print `ctrlrun inspect --hop <id>` has no id to print.
+AUTHORITY_HOP: Final = "authority_hop"
 NO_AUTHORITY: Final = "no_authority"
 
 #: §4.3 — fixed rather than short-circuited, so the evidence for one configuration does not
@@ -73,7 +99,16 @@ REASON_PRECEDENCE: Final = (
     AUTHORITY_ESCALATION,
     AUTHORITY_REVOKED,
     AUTHORITY_EXPIRED,
+    # SPEC-v0.9 §6.2 — above `authority_constraint` on this section's own rule, that the reason
+    # should name what will still be wrong after the caller changes the request. A task is a
+    # property of the run and a constraint a property of one call's arguments: change the
+    # arguments and the task is still wrong.
+    AUTHORITY_TASK,
     AUTHORITY_CONSTRAINT,
+    # SPEC-v0.10 §2.3.2 — above `no_authority` and below everything that inspects a grant the hop
+    # actually reached. A presented hop that does not reach the action is a fact about the hop; the
+    # reasons above are facts about a grant that did reach it, and they are more specific.
+    AUTHORITY_HOP,
     NO_AUTHORITY,
 )
 
@@ -97,7 +132,23 @@ _ID_HEX_BYTES: Final = 16  # "dlg_" + 32 hex chars
 #: §5.2, §5.7 — `api` for `Control.delegate`, where `by` came from wherever the application's
 #: identity came from, and `cli` for `ctrlrun delegate`, where it came from a shell. A reader of
 #: the evidence can tell an act from an assertion, which is the whole reason the field exists.
-_CREATED_VIA: Final[Mapping[str, Literal["api", "cli"]]] = {"api": "api", "cli": "cli"}
+#: SPEC-v0.3 §5.3, SPEC-v0.8 §5.3, §11.1. The vocabulary is **closed** and a record carrying a
+#: value outside it is unreadable, which makes `_candidates` raise and answers
+#: `authority_unreadable` for **every action in the deployment**. So the third value is a public
+#: change that moves the `Literal`, this mapping and every reader together, in one commit; a
+#: deployment that wrote `break-glass` rows under a reader that knew two values would deny
+#: everything, which is fail-closed and useless.
+#: SPEC-v0.10 §2.2 — `hop` is the fourth value, for a delegation created across an agent boundary
+#: by `Control.hop`. §9.3 states what it costs: an older binary meeting one denies **every action in
+#: the deployment**, so creating the first hop is the irreversible step of the 0.10 upgrade.
+CreatedVia = Literal["api", "cli", "break-glass", "hop"]
+
+_CREATED_VIA: Final[Mapping[str, CreatedVia]] = {
+    "api": "api",
+    "cli": "cli",
+    "break-glass": "break-glass",
+    "hop": "hop",
+}
 
 #: SPEC-v0.3 §5.3 — the creation-time vocabulary. Disjoint from the evaluation reasons above,
 #: and never used interchangeably with them: a test asserting `authority_escalation` on a
@@ -111,7 +162,20 @@ CONTAINMENT: Final = "containment"
 
 #: §5.4's rows, in the order they are checked. Each is separately testable and separately
 #: mutable; T76 breaks each one alone.
-DIMENSIONS: Final = ("subject", "actions", "resources", "constraints", "environments", "expires_at")
+DIMENSIONS: Final = (
+    "subject",
+    "actions",
+    "resources",
+    "constraints",
+    "environments",
+    "expires_at",
+    # SPEC-v0.9 §8.0 — exported, iterated by `verify`'s G9 and printed as `len(DIMENSIONS)`, and
+    # asserted by exact list equality in `tests/test_verify_authority.py`. Growing it without
+    # `_narrowed` carrying the field raises `VerifyInternalError`; adding the containment row
+    # without growing it reports "6 of 6" and exercises neither, which is the silent failure.
+    "tasks",
+    "budgets",
+)
 
 #: §5.4 — how a child operand must compare with its parent's, per operator. `neq` is equality
 #: rather than the superset a deny-list would need: `v0.1 §3.2` has no deny-list operator and a
@@ -125,7 +189,14 @@ _STRICTER: Final = {
 }
 
 _AUTHORITY_KEY: Final = "authority"
-_AUTHORITY_KEYS: Final = frozenset({"max_delegation_depth", "grants"})
+_AUTHORITY_KEYS: Final = frozenset({"max_delegation_depth", "grants", "break_glass"})
+
+#: SPEC-v0.8 §5.2 — an envelope's keys: a grant's, minus the two it may not carry, plus the two
+#: that make it an envelope. `delegable:` and `expires_at:` are **named refusals** rather than
+#: silent omissions, because the grant parser accepts both and an operator writing
+#: `delegable: true` would then owe an `expires_at` an envelope does not have.
+_ENVELOPE_ONLY_KEYS: Final = frozenset({"max_ttl", "controls"})
+_ENVELOPE_REFUSED_KEYS: Final = frozenset({"delegable", "expires_at"})
 _GRANT_KEYS: Final = frozenset(
     {
         "id",
@@ -136,6 +207,13 @@ _GRANT_KEYS: Final = frozenset(
         "environments",
         "expires_at",
         "delegable",
+        # SPEC-v0.9 §6.1, and a `ctrlrun.policy/v7` key: an older reader meeting it would grant
+        # the action on every task, so `policy.py` refuses it in a `v6` document rather than
+        # ignoring it (§10.1).
+        "tasks",
+        # SPEC-v0.9 §2.2, the other `v7` key, gated for the same reason: an older reader would
+        # ignore the limit and spend without bound.
+        "budgets",
     }
 )
 _SUBJECT_KEYS: Final = frozenset({"agent", "user"})
@@ -295,6 +373,67 @@ class Subject:
         return True
 
 
+def _is_int(value: object) -> bool:
+    """A real integer: `bool` is an `int` in Python and is not one here (SPEC-v0.9 §2.3).
+
+    `verify/scenarios.py` and `_parse_max_delegation_depth` already guard this trap; the budget
+    loader uses the same predicate rather than a third spelling of it. `amount: false` would
+    otherwise be a "non-negative integer" whose value is zero, which is §2.3's own sentence about
+    absence-as-zero wearing a bool's clothes.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+@dataclass(frozen=True)
+class Budget:
+    """How much, over what, in how long (SPEC-v0.9 §2.2).
+
+    A metric names where the number comes from, a limit is what the sum may reach, and a window
+    is what the sum is taken over. The kernel **does not know what any metric means**: there is no
+    branch on a metric name anywhere, no ranking of two metrics, and no default limit for one the
+    kernel thinks it recognises (§2.3, and §12 carries it as a do-not-build line).
+
+    Validated here as well as in the loader, on `Grant.__post_init__`'s rule: `Control.delegate`
+    takes a `Grant` built in Python, and §2.6's containment relation is undefined on a budget
+    whose window is negative or whose limit is a string.
+    """
+
+    metric: str
+    limit: int
+    window: timedelta
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.metric, str) or not self.metric.strip():
+            raise InvalidArgument(
+                f"a budget metric must be a non-empty string, got {self.metric!r}"
+            )
+        if not _is_int(self.limit) or self.limit < 0:
+            # §2.3: a float would drift, a bool is an int wearing a costume, and a string that
+            # looks like a number is a decimal in disguise. None of the three is coerced.
+            raise InvalidArgument(
+                f"budget {self.metric!r}: 'limit' must be a non-negative integer, got "
+                f"{self.limit!r}. Money is budgeted in minor units (SPEC-v0.9 §2.3)"
+            )
+        if not isinstance(self.window, timedelta) or self.window <= timedelta(0):
+            raise InvalidArgument(
+                f"budget {self.metric!r}: 'window' must be a positive duration, got {self.window!r}"
+            )
+        # **Whole seconds, because a `Budget` that cannot round-trip is not a legal one.**
+        # `grant_to_json` renders integer seconds, so `timedelta(milliseconds=500)` would store as
+        # `0` and read back as an unreadable delegation, dead for ever. `Control.delegate` takes a
+        # `Grant` built in Python, which is §2.2's whole reason for validating here as well as in
+        # the loader, and the loader's grammar is integer-only anyway.
+        if self.window.microseconds:
+            raise InvalidArgument(
+                f"budget {self.metric!r}: 'window' must be a whole number of seconds, got "
+                f"{self.window!r}; it is stored and hashed as integer seconds (SPEC-v0.9 §2.8)"
+            )
+        if self.window.total_seconds() > _MAX_WINDOW_SECONDS:
+            raise InvalidArgument(
+                f"budget {self.metric!r}: 'window' may not exceed {_MAX_WINDOW_SECONDS} seconds"
+            )
+
+
 @dataclass(frozen=True)
 class Grant:
     """One permission: this subject may propose these actions, under these limits (§4.2).
@@ -314,6 +453,15 @@ class Grant:
     environments: tuple[str, ...] | None = None
     expires_at: datetime | None = None
     delegable: bool = False
+    #: SPEC-v0.9 §6.1 — the unit of work this grant is for. `None` grants any task (§6.5), which
+    #: is `v0.3 §4.2`'s rule for `resources` and the reason every existing grant upgrades
+    #: untouched. A child that omits it under a parent that names it is rejected (§6.2).
+    tasks: tuple[str, ...] | None = None
+    #: SPEC-v0.9 §2.2 — how much this grant may spend, over which metric, in how long. A list and
+    #: not a mapping: two budgets on one metric over two windows is the first thing an operator
+    #: asks for, and a mapping keyed by metric cannot express it. `None` budgets nothing, which is
+    #: every grant written before v0.9 and why they all upgrade untouched.
+    budgets: tuple[Budget, ...] | None = None
 
     def __post_init__(self) -> None:
         # An empty id is legal only on the `Control.delegate` path and only until the call
@@ -349,6 +497,28 @@ class Grant:
                         f"grant {self.id!r}: an environment must be a non-empty string, "
                         f"got {name!r}"
                     )
+        if self.tasks is not None:
+            object.__setattr__(self, "tasks", tuple(self.tasks))
+            if not self.tasks:
+                raise InvalidArgument(
+                    f"grant {self.id!r}: 'tasks' must be a non-empty list, or absent — "
+                    "an absent 'tasks' is what grants any task (SPEC-v0.9 §6.5)"
+                )
+            for pattern in self.tasks:
+                validate_pattern(pattern, separator=TASK_SEPARATOR, where=f"grant {self.id!r} task")
+        if self.budgets is not None:
+            object.__setattr__(self, "budgets", tuple(self.budgets))
+            if not self.budgets:
+                raise InvalidArgument(
+                    f"grant {self.id!r}: 'budgets' must be a non-empty list, or absent — "
+                    "an absent 'budgets' is what budgets nothing (SPEC-v0.9 §2.2)"
+                )
+            for budget in self.budgets:
+                if not isinstance(budget, Budget):
+                    raise InvalidArgument(
+                        f"grant {self.id!r}: a budget must be an authority.Budget, "
+                        f"got {_type_name(budget)}"
+                    )
         for key, condition in self.constraints.items():
             if not isinstance(condition, Condition):
                 raise InvalidArgument(
@@ -383,27 +553,28 @@ class Grant:
         return self.expires_at is not None and now > self.expires_at
 
     def matches_shape(self, action: Action) -> bool:
-        """Subject, action name, resource and environment — all four, or no match (§4.3)."""
-        if not self.subject.matches(action.principal):
+        """Subject, action name, resource and environment — all four, or no match (§4.3).
+
+        **One implementation, and it is `unmatched_shape`'s** (SPEC-v0.10 §2.3.2): that function
+        answers *which* of the four failed, this one answers *whether* any did, and a second walk
+        here would be two things that agree today. `contained_dimension` and `v0.3 §5.4` are the
+        same arrangement for the other half of §4.3's `iff`.
+        """
+        return unmatched_shape(self, action) is None
+
+    def task_holds(self, task: str | None) -> bool:
+        """Is this grant good for the task the caller named? (SPEC-v0.9 §6.4, §6.5.)
+
+        A grant naming no task holds for any, including none: `v0.3 §4.2`'s rule for an absent
+        `resources`, and §6.5 is where the asymmetry with §5.4 is argued. A grant naming tasks
+        refuses a caller who named none, because a dimension anybody may decline to supply is
+        one an attacker may decline to supply.
+        """
+        if self.tasks is None:
+            return True
+        if task is None:
             return False
-        if not any(
-            matches(pattern, action.name, separator=ACTION_SEPARATOR) for pattern in self.actions
-        ):
-            return False
-        if self.resources is not None:
-            # §4.4 — an action whose resource is None does not match a grant that declares
-            # `resources:`. To grant an action that carries no resource, omit the key.
-            if action.resource is None:
-                return False
-            if not any(
-                matches(pattern, action.resource, separator=RESOURCE_SEPARATOR)
-                for pattern in self.resources
-            ):
-                return False
-        # §4.2 — matched by exact string, not by pattern: an environment name is a short
-        # closed list, and a glob over it buys nothing but a way to typo `prod*` into
-        # matching `production-canary`.
-        return self.environments is None or action.environment in self.environments
+        return any(matches(pattern, task, separator=TASK_SEPARATOR) for pattern in self.tasks)
 
     def constraints_hold(self, action: Action) -> bool:
         """All constraints, ANDed. An absent argument makes one false and logs (§4.5)."""
@@ -428,7 +599,7 @@ class Delegation:
     depth: int
     grant: Grant
     created_by: Principal
-    created_via: Literal["api", "cli"]
+    created_via: CreatedVia
     created_at: datetime
     revoked_at: datetime | None = None
     revoked_by: str | None = None
@@ -469,6 +640,10 @@ class AuthorityResult:
     grant_id: str | None = None
     delegation_id: str | None = None
     depth: int = 0
+    #: SPEC-v0.10 §2.3.2 — the hop that was presented, on every result an action under one
+    #: produces, passing or failing. `data.hop` is what §6.3 turns into a command, and §3.3 is why
+    #: the id may be echoed while nothing else about the envelope may.
+    hop: str | None = None
     dimension: str | None = None
     missing_parent_id: str | None = None
     expired_parent_id: str | None = None
@@ -477,6 +652,21 @@ class AuthorityResult:
 
 
 # --- serialization and containment (SPEC-v0.3 §5.2, §5.4, §5.5) -------------------------
+
+
+class _HopRefusedError(Exception):
+    """A presented hop that does not reach this action (SPEC-v0.10 §2.3.2 rule 2).
+
+    Internal, and `_UnreadableError`'s shape: `evaluate` turns it into `authority_hop`. It carries
+    `dimension` only where the delegation exists, because an id naming nothing has no grant whose
+    rows could have failed, and a `dimension` on that refusal would be evidence about a record
+    nobody has.
+    """
+
+    def __init__(self, *, grant_id: str | None = None, dimension: str | None = None) -> None:
+        super().__init__(grant_id or "<unknown hop>")
+        self.grant_id = grant_id
+        self.dimension = dimension
 
 
 class _UnreadableError(Exception):
@@ -515,6 +705,29 @@ def grant_to_json(grant: Grant) -> str:
         "environments": None if grant.environments is None else list(grant.environments),
         "expires_at": None if grant.expires_at is None else grant.expires_at.isoformat(),
         "delegable": grant.delegable,
+        # SPEC-v0.9 §6. A delegation is stored as this JSON and read back through
+        # `grant_from_json` on **every** evaluation (§5.6), so a dimension missing here reads
+        # back as `None`: the child would be unbound by task while its parent named one, and
+        # §5.6's re-check would then refuse it `authority_escalation` on `tasks` forever. The
+        # round trip is the containment, not a convenience.
+        "tasks": None if grant.tasks is None else list(grant.tasks),
+        # SPEC-v0.9 §2.7, and item 1's lesson repeated: a delegation is stored as this JSON and
+        # read back on **every** evaluation (`v0.3 §5.6`), so a dimension missing here reads back
+        # as `None`. The child would be unbudgeted while its parent carried a limit, and §5.6's
+        # re-check would refuse it `authority_escalation` on `budgets` forever. The round trip is
+        # the containment, not a convenience.
+        "budgets": (
+            None
+            if grant.budgets is None
+            else [
+                {
+                    "metric": budget.metric,
+                    "limit": budget.limit,
+                    "window": int(budget.window.total_seconds()),
+                }
+                for budget in grant.budgets
+            ]
+        ),
     }
     return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -558,9 +771,72 @@ def grant_from_json(text: str, *, delegation_id: str) -> Grant:
             environments=_optional_tuple(document.get("environments"), delegation_id),
             expires_at=None if expires_at is None else datetime.fromisoformat(str(expires_at)),
             delegable=bool(document.get("delegable", False)),
+            tasks=_optional_tuple(document.get("tasks"), delegation_id),
+            budgets=_budgets_from_json(document.get("budgets"), delegation_id),
         )
-    except (InvalidArgument, PolicyError, TypeError, ValueError) as exc:
+    except (ArithmeticError, InvalidArgument, PolicyError, TypeError, ValueError) as exc:
         raise _UnreadableError(delegation_id, str(exc)) from exc
+
+
+#: SPEC-v0.9 §2.2 — the widest window a budget may carry, in seconds: a hundred years, which is
+#: past any rolling window an operator means and well inside what `timedelta` can hold. It exists
+#: so a stored row cannot raise `OverflowError` out of `Authority.evaluate`, which `_candidates`
+#: would turn into a deployment-wide outage rather than one unreadable delegation.
+_MAX_WINDOW_SECONDS: Final = 100 * 365 * 24 * 60 * 60
+
+
+def _budgets_from_json(value: object, delegation_id: str) -> tuple[Budget, ...] | None:
+    """Read a delegation's budgets back, validating exactly what the loader validated.
+
+    `grant_from_json`'s rule for every other dimension: a row read back is re-validated, because
+    a store is a place an attacker with write access reaches and `v0.3 §5.2` requires reading a
+    grant back to check what loading one from YAML checks.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise _UnreadableError(delegation_id, "grant_json 'budgets' is not a non-empty list")
+    parsed: list[Budget] = []
+    for entry in value:
+        if not isinstance(entry, Mapping):
+            raise _UnreadableError(delegation_id, "grant_json has a budget that is not an object")
+        # The loader's key set is closed (`_BUDGET_KEYS`) and this docstring claims to validate
+        # exactly what the loader validates, so it is closed here too. An independent review found
+        # the two disagreeing: a stored row could carry a key the document could not.
+        unknown = set(entry) - _BUDGET_KEYS
+        if unknown:
+            raise _UnreadableError(
+                delegation_id, f"grant_json budget has unknown keys {sorted(unknown)}"
+            )
+        window = entry.get("window")
+        # **The bool trap, one field over from where `limit` closes it**, and an independent
+        # review found it: `timedelta(seconds=True)` is a ONE-SECOND window, and a shorter window
+        # is a higher rate, so the failure grants authority. `0.5` is a sub-second window the
+        # loader's integer-only grammar cannot express. Same predicate as `limit`, not a second
+        # spelling of it. The bound is what keeps `timedelta` from raising `OverflowError` out of
+        # `Authority.evaluate`, which `_candidates` makes a deployment-wide outage: it reads every
+        # delegation row on every evaluation, so one corrupt row would deny nothing and crash
+        # everything, for every principal and every action.
+        if not _is_int(window) or not 0 < cast("int", window) <= _MAX_WINDOW_SECONDS:
+            raise _UnreadableError(
+                delegation_id,
+                f"grant_json budget 'window' must be a positive whole number of seconds up to "
+                f"{_MAX_WINDOW_SECONDS}, got {window!r}",
+            )
+        try:
+            # `cast` and not a check: `Budget.__post_init__` validates all three, and a second
+            # copy of that grammar here is the drift §2.2 forbids. The types are the store's
+            # word, which is exactly what re-validating exists to distrust.
+            parsed.append(
+                Budget(
+                    metric=cast("str", entry.get("metric")),
+                    limit=cast("int", entry.get("limit")),
+                    window=timedelta(seconds=cast("int", window)),
+                )
+            )
+        except (ArithmeticError, InvalidArgument, TypeError, ValueError) as exc:
+            raise _UnreadableError(delegation_id, f"grant_json budget: {exc}") from exc
+    return tuple(parsed)
 
 
 def _optional_tuple(value: object, delegation_id: str) -> tuple[str, ...] | None:
@@ -600,6 +876,117 @@ def _delegation_from_record(record: DelegationRecord) -> Delegation:
     )
 
 
+#: SPEC-v0.9 §2.3 — the one metric the kernel supplies, and the only one whose meaning does not
+#: depend on the document. An action argument literally named `count` does not win it: an operator
+#: writing `metric: count` means "how many", and a document that could retarget it would make the
+#: one metric independent of the document depend on it.
+COUNT_METRIC: Final = "count"
+
+
+def _metric_value(action: Action, metric: str, grant_id: str) -> int:
+    """What this action spends on this metric (SPEC-v0.9 §2.3).
+
+    `count` is one per action. Every other metric names an **action argument**, by name, and its
+    value is summed. **An action that does not carry the argument is refused, not treated as
+    zero**: treating a missing field as zero turns the absence of a value into unlimited
+    authority, which is the sentence `v0.3 §5.4` exists to refuse on the constraint side.
+
+    The kernel does not know what any metric means. There is no branch here on a metric name
+    beyond `count`'s own source, no ranking of two metrics, and no default limit for a name the
+    kernel thinks it recognises (§12).
+    """
+    if metric == COUNT_METRIC:
+        return 1
+    value = action.canonical_arguments.get(metric)
+    if value is None:
+        raise InvalidArgument(
+            f"{action.name}: grant {grant_id!r} budgets {metric!r} and the action carries no "
+            f"{metric!r} argument. A missing value is refused, never counted as zero "
+            "(SPEC-v0.9 §2.3)"
+        )
+    if not _is_int(value) or value < 0:
+        raise InvalidArgument(
+            f"{action.name}: grant {grant_id!r} budgets {metric!r} and the action's value is "
+            f"{value!r}; a metric value is a non-negative integer, so money is budgeted in minor "
+            "units (SPEC-v0.9 §2.3)"
+        )
+    return int(value)
+
+
+def unmatched_shape(grant: Grant, action: Action) -> str | None:
+    """The first of §4.3's four shape rows `action` fails against `grant`, or `None` (v0.10 §2.3.2).
+
+    `matches_shape` is this, reduced to a bool. It exists as its own name because a **presented
+    hop** that does not reach an action must report *which* row stopped it: without it three of the
+    six refusal shapes answer `no_authority` with no `grant_id`, which an operator cannot tell from
+    holding no authority at all, and §6.3's "print the command with its argument filled in" has no
+    argument. `v0.9 §6.2` made the same argument for `authority_task` against the `environments`
+    precedent.
+
+    Order is §4.3's, and it is fixed for `contained_dimension`'s reason: the evidence for one
+    configuration must not depend on the order an implementation happens to check things in.
+    """
+    if not grant.subject.matches(action.principal):
+        return "subject"
+    if not any(
+        matches(pattern, action.name, separator=ACTION_SEPARATOR) for pattern in grant.actions
+    ):
+        return "actions"
+    if grant.resources is not None:
+        # §4.4 — an action whose resource is None does not match a grant that declares
+        # `resources:`. To grant an action that carries no resource, omit the key.
+        if action.resource is None:
+            return "resources"
+        if not any(
+            matches(pattern, action.resource, separator=RESOURCE_SEPARATOR)
+            for pattern in grant.resources
+        ):
+            return "resources"
+    # §4.2 — matched by exact string, not by pattern: an environment name is a short closed list,
+    # and a glob over it buys nothing but a way to typo `prod*` into matching `production-canary`.
+    if grant.environments is not None and action.environment not in grant.environments:
+        return "environments"
+    return None
+
+
+def narrowed_dimensions(parent: Grant, child: Grant) -> tuple[str, ...]:
+    """Which of §5.4's rows `child` makes strictly stricter than `parent` (SPEC-v0.10 §6.2).
+
+    **A reporting helper. It decides nothing**, and that is the line that keeps §2.2's
+    one-relation rule intact: `contained_dimension` stays the only thing any decision calls, and a
+    build where this disagreed with it would be wrong about a rendering rather than about an
+    authorization.
+
+    It exists because `contained_dimension` computes the **complement**: the first row a child
+    *violates*, or `None` where it is contained. An operator reading a refused action's chain needs
+    the other question, *which link took the resource away*, and no name in the tree answered it.
+
+    Plural, in `DIMENSIONS` order. A hop narrowed on every dimension narrows on several at once
+    (T470), so a singular answer has no definition.
+    """
+    narrowed: list[str] = []
+    if parent.subject != child.subject:
+        narrowed.append("subject")
+    if set(parent.actions) != set(child.actions):
+        narrowed.append("actions")
+    if parent.resources != child.resources and child.resources is not None:
+        narrowed.append("resources")
+    if dict(parent.constraints) != dict(child.constraints):
+        narrowed.append("constraints")
+    if parent.environments != child.environments and child.environments is not None:
+        narrowed.append("environments")
+    if child.expires_at is not None and (
+        parent.expires_at is None or child.expires_at < parent.expires_at
+    ):
+        narrowed.append("expires_at")
+    if parent.tasks != child.tasks and child.tasks is not None:
+        narrowed.append("tasks")
+    if parent.budgets != child.budgets and child.budgets is not None:
+        narrowed.append("budgets")
+    order = {name: index for index, name in enumerate(DIMENSIONS)}
+    return tuple(sorted(narrowed, key=lambda name: order[name]))
+
+
 def contained_dimension(parent: Grant, child: Grant) -> str | None:
     """The first §5.4 row `child` violates, or `None` where it is contained on every one.
 
@@ -628,7 +1015,55 @@ def contained_dimension(parent: Grant, child: Grant) -> str | None:
         child.expires_at is None or child.expires_at > parent.expires_at
     ):
         return "expires_at"
+    # SPEC-v0.9 §6.2 — the same shape as `resources`: a parent that constrains the dimension is
+    # not discharged by a child that omits it (`v0.3 §5.4`), and a parent that names none
+    # constrains nothing here.
+    if parent.tasks is not None and (
+        child.tasks is None
+        or not _patterns_contained(parent.tasks, child.tasks, separator=TASK_SEPARATOR)
+    ):
+        return "tasks"
+    if not _budgets_contained(parent.budgets, child.budgets):
+        return "budgets"
     return None
+
+
+def _budgets_contained(parent: tuple[Budget, ...] | None, child: tuple[Budget, ...] | None) -> bool:
+    """§2.6.1: for every parent budget there must exist a child budget that discharges it.
+
+    **The window axis reads backwards on first encounter, and the backwards reading is the
+    dangerous one**, so it is spelled out rather than left to the comparison. Over the same limit
+    a *shorter* window is a *higher rate*, and therefore more authority: a parent of 100,000 per
+    rolling day is widened, not narrowed, by a child of 100,000 per rolling hour, which is
+    2,400,000 a day. A draft of this rule compared `<=` on the window and would have accepted that
+    child at 24x while rejecting the child of 100,000 per week, which is one seventh the rate.
+
+    The proof, given §2.3's non-negative values: take any interval of length `window_p`; it sits
+    inside some interval of length `window_c`, whose sum is at most `limit_c`, which is at most
+    `limit_p`. So every spend pattern the child permits, the parent permits. Non-negativity is
+    what makes the sum monotonic over nested intervals, and without it none of this holds.
+
+    **Existential, not positional**: one child budget may discharge several parent budgets, and a
+    child may add budgets on metrics the parent does not budget. Matching by metric alone is
+    undecidable the moment a parent carries two budgets on `amount`, which is the case §2.2 exists
+    for; matching by `(metric, window)` would make the window axis vacuous.
+    """
+    if parent is None:
+        # A parent that budgets nothing constrains nothing here, and a child may add its own.
+        return True
+    for outer in parent:
+        if not any(
+            inner.metric == outer.metric
+            and inner.limit <= outer.limit
+            and inner.window >= outer.window
+            for inner in (child or ())
+        ):
+            # `v0.3 §5.4`: omission never means unlimited. A child that drops the parent's budget
+            # is rejected rather than inheriting it, for that section's reason: a child that
+            # silently inherited would look, in the file and in the receipt, like one authorized
+            # for what it says.
+            return False
+    return True
 
 
 def _subject_contained(parent: Subject, child: Subject) -> bool:
@@ -708,6 +1143,12 @@ class _Walk:
     missing_parent_id: str | None = None
     cycle_at: str | None = None
     depth_exceeded: int | None = None
+    #: SPEC-v0.8 §5.2 point 4 — did the root come from `Authority.envelopes`? `delegable` is
+    #: read at three sites that each decide something, and an envelope carries no such key,
+    #: so an envelope ancestor **counts as** delegable at all three. "Counts as", and never a
+    #: `delegable=True` written onto the parsed grant: the rendered value must come from the
+    #: document, or the policy hash would move because of a runtime rule (T332).
+    root_is_envelope: bool = False
 
     @property
     def complete(self) -> bool:
@@ -719,6 +1160,19 @@ class _Walk:
         above: list[Grant] = [] if self.root is None else [self.root]
         above.extend(node.grant for node in reversed(self.nodes[1:]))
         return tuple(above)
+
+    @property
+    def undelegable_ancestor(self) -> bool:
+        """Is any ancestor one that may not be delegated beneath? (SPEC-v0.8 §5.2 point 4.)
+
+        The root is exempt where it is an envelope, which is the whole of the rule: an envelope
+        exists only to be a parent, and what bounds the population it can reach is `max_ttl`
+        rather than `delegable`. Every other ancestor is read exactly as before.
+        """
+        above = self.ancestors
+        if self.root_is_envelope and above:
+            above = above[1:]
+        return any(not ancestor.delegable for ancestor in above)
 
     @property
     def ancestor_ids(self) -> tuple[str, ...]:
@@ -748,6 +1202,36 @@ def _by_grant_id(result: AuthorityResult) -> str:
     return result.grant_id or ""
 
 
+@dataclass(frozen=True)
+class BreakGlassEnvelope:
+    """The widest authority an incident may reach, declared in advance (SPEC-v0.8 §5.2).
+
+    An envelope is a `Grant` in every respect the parser knows, plus the longest expiry a grant
+    beneath it may carry and the controls whose `approver_role` gates who may open one. It is
+    **not** in `Authority.grants`, so `_candidates` cannot return it and it decides no action:
+    that is T330 true by construction rather than by a filter somebody can delete.
+
+    It carries no `delegable` and no `expires_at`. `delegable` is what ordinarily says a grant
+    may be delegated beneath, and the reason behind that rule -- that nothing else bounds the
+    population a delegable grant can reach -- is met here by `max_ttl`, which bounds every child
+    in time and is required. An envelope exists only to be a parent.
+    """
+
+    grant: Grant
+    max_ttl: timedelta
+    controls: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.max_ttl <= timedelta(0):
+            raise InvalidArgument(
+                f"break-glass envelope {self.grant.id!r}: 'max_ttl' must be a positive duration"
+            )
+
+    @property
+    def id(self) -> str:
+        return self.grant.id
+
+
 class Authority:
     """The `authority:` section, loaded and evaluable (SPEC-v0.3 §4).
 
@@ -761,16 +1245,26 @@ class Authority:
         *,
         max_delegation_depth: int = DEFAULT_MAX_DELEGATION_DEPTH,
         source: str = "<string>",
+        envelopes: Mapping[str, BreakGlassEnvelope] | None = None,
     ) -> None:
         if max_delegation_depth < 0:
             raise InvalidArgument("max_delegation_depth must be a non-negative int")
         self._grants = MappingProxyType(dict(grants))
         self._max_delegation_depth = max_delegation_depth
         self._source = source
+        # SPEC-v0.8 §5.2: a **separate mapping**, and that is the whole design. `_candidates`
+        # returns every entry of `_grants` unconditionally, so an envelope living there would
+        # decide actions, which is the opposite of what it is for.
+        self._envelopes = MappingProxyType(dict(envelopes or {}))
 
     @property
     def grants(self) -> Mapping[str, Grant]:
         return self._grants
+
+    @property
+    def envelopes(self) -> Mapping[str, BreakGlassEnvelope]:
+        """The break-glass envelopes (SPEC-v0.8 §5.2). Never consulted by `evaluate`."""
+        return self._envelopes
 
     @property
     def max_delegation_depth(self) -> int:
@@ -803,7 +1297,16 @@ class Authority:
             )
         return authority
 
-    def evaluate(self, action: Action, *, now: datetime, store: StateStore) -> AuthorityResult:
+    def evaluate(
+        self,
+        action: Action,
+        *,
+        now: datetime,
+        store: StateStore,
+        task: str | None = None,
+        evaluate_task: bool = True,
+        hop: str | None = None,
+    ) -> AuthorityResult:
         """Does any grant cover this action? (SPEC-v0.3 §4.3.)
 
         Passes iff at least one grant matches subject, action name, resource and environment,
@@ -816,14 +1319,31 @@ class Authority:
         evaluation and that walk reads the store. An optional one would give an implementation
         a fail-open reading in which a revoked delegation evaluates as valid, and "a chain of
         any depth is cut by one write" would stop being true.
+
+        **`task` is SPEC-v0.9 §6, and this signature amends the one `v0.3 §11` froze** (§10.3).
+        It defaults to `None`, which a grant naming no task authorises (§6.5) and a grant naming
+        one refuses (§6.4). `evaluate_task=False` is §6.3.2's third mode, for `Control.resume`
+        and for a lease extension: the action is rehydrated from the store and carries no task,
+        so evaluating the dimension there would deny every resumed leg, on what
+        `control.py` calls the only receipt an MCP multi round-trip ever gets.
         """
         passed: list[AuthorityResult] = []
         failed: dict[str, list[AuthorityResult]] = {}
         try:
-            candidates = self._candidates(store)
+            candidates = (
+                self._candidates(store) if hop is None else self._hop_candidate(hop, action, store)
+            )
         except _UnreadableError as unreadable:
             return AuthorityResult(
-                False, AUTHORITY_UNREADABLE, delegation_id=unreadable.delegation_id
+                False, AUTHORITY_UNREADABLE, delegation_id=unreadable.delegation_id, hop=hop
+            )
+        except _HopRefusedError as refused:
+            return AuthorityResult(
+                False,
+                AUTHORITY_HOP,
+                hop=hop,
+                grant_id=refused.grant_id,
+                dimension=refused.dimension,
             )
         for grant_id, grant, delegation in candidates:
             if not grant.matches_shape(action):
@@ -834,8 +1354,17 @@ class Authority:
                 try:
                     chain = self._check_chain(delegation, store=store, now=now)
                 except _UnreadableError as unreadable:
+                    # SPEC-v0.10 §9 — `hop` is on **every** result an action under one produces,
+                    # passing or failing, which is what lets §6.3 print a command for each. This
+                    # path is the chain walk's own unreadable record, one frame below the
+                    # identical handler above, and it was the one return that dropped it: an
+                    # independent review found a hop with an unreadable ANCESTOR refusing with
+                    # `hop=None`, leaving §6.3 no argument to print.
                     return AuthorityResult(
-                        False, AUTHORITY_UNREADABLE, delegation_id=unreadable.delegation_id
+                        False,
+                        AUTHORITY_UNREADABLE,
+                        delegation_id=unreadable.delegation_id,
+                        hop=hop,
                     )
                 depth = chain.depth
                 if chain.failure is not None:
@@ -844,6 +1373,8 @@ class Authority:
                 outcomes.append(AuthorityResult(False, AUTHORITY_EXPIRED))
             if not grant.constraints_hold(action):
                 outcomes.append(AuthorityResult(False, AUTHORITY_CONSTRAINT))
+            if evaluate_task and not grant.task_holds(task):
+                outcomes.append(AuthorityResult(False, AUTHORITY_TASK))
             named = None if delegation is None else grant_id
             if outcomes:
                 # §4.3 — every reason a grant failed for, collected rather than
@@ -865,14 +1396,159 @@ class Authority:
                 )
         if passed:
             # §4.6 — holding two permissions is never worse than holding one, and the grant
-            # named is a property of the set rather than of the document.
-            return min(passed, key=_by_grant_id)
+            # named is a property of the set rather than of the document. **Under a hop there is
+            # exactly one candidate** (SPEC-v0.10 §2.3.2 rule 1), so this picks it rather than
+            # choosing, and the codepoint order §2.3.1 measured decides nothing.
+            return replace(min(passed, key=_by_grant_id), hop=hop)
         for reason in REASON_PRECEDENCE:
             if reason in failed:
-                return min(failed[reason], key=_by_grant_id)
-        return AuthorityResult(False, NO_AUTHORITY)
+                return replace(min(failed[reason], key=_by_grant_id), hop=hop)
+        return AuthorityResult(False, NO_AUTHORITY, hop=hop)
+
+    def _charges_for(
+        self, action: Action, result: AuthorityResult, *, store: StateStore
+    ) -> tuple[Charge, ...]:
+        """Every budget this action spends against, one `Charge` per ancestor (SPEC-v0.9 §2.7).
+
+        **Package-internal**: §10 freezes `Charge` and `charges=`, not a way to obtain them, and
+        a public method here would be a surface nothing asked for.
+
+        §2.7 is the rule that makes the feature mean anything. Without charging every ancestor, a
+        holder of a 100,000-a-day grant delegates ten correctly-contained children and spends
+        1,000,000: every link individually valid, the total ten times what anybody granted.
+
+        Returns `()` where the deciding grant and its chain budget nothing, which is every grant
+        written before v0.9 and why they all upgrade untouched (R5).
+        """
+        if not result.passed or result.grant_id is None:
+            return ()
+        charged: list[tuple[str, Grant]] = []
+        delegation = None
+        if result.delegation_id is not None:
+            record = store.get_delegation(result.delegation_id)
+            delegation = None if record is None else _delegation_from_record(record)
+        if delegation is None:
+            grant = self._grants.get(result.grant_id)
+            if grant is not None:
+                charged.append((result.grant_id, grant))
+        else:
+            walk = self._walk(delegation, store=store)
+            charged.append((delegation.delegation_id, delegation.grant))
+            charged.extend(zip(walk.ancestor_ids, walk.ancestors, strict=True))
+        made: list[Charge] = []
+        for grant_id, grant in charged:
+            for budget in grant.budgets or ():
+                made.append(
+                    Charge(
+                        grant_id=grant_id,
+                        metric=budget.metric,
+                        amount=_metric_value(action, budget.metric, grant_id),
+                        limit=budget.limit,
+                        window=budget.window,
+                    )
+                )
+        return tuple(made)
 
     # --- delegation (SPEC-v0.3 §5) -----------------------------------------------------
+
+    def plan_break_glass(
+        self,
+        envelope_id: str,
+        grant: Grant,
+        *,
+        by: Principal,
+        store: StateStore,
+        now: datetime,
+    ) -> Delegation:
+        """The delegation `Control.break_glass` would write, or a refusal (SPEC-v0.8 §5.3).
+
+        `plan_delegation` with two differences, and both are §5.3.1's:
+
+        - **`envelope_id` resolves only in `envelopes`.** An id naming an ordinary grant is
+          refused by name, whether or not it also names nothing here. Without that,
+          `--envelope <a delegable grant id>` would reach a path where rule 4 is skipped for a
+          grant that has no `controls:` to gate it instead, which is strictly weaker than what
+          `ctrlrun delegate` requires beneath the same grant (T334b).
+        - **Rule 4 does not apply.** An envelope's subject names the agents a break-glass grant
+          may be *for*; the principal opening one is a human. What gates the opener is the
+          envelope's `controls:`, checked by `Control` where the approver identity is.
+
+        Every other rule of `v0.3 §5.3` applies unchanged: unknown parent, expiry, containment,
+        depth. And one this adds: a grant beneath an envelope **must** carry an expiry, and one
+        beyond `max_ttl` is refused.
+        """
+        envelope = self._envelopes.get(envelope_id)
+        if envelope is None:
+            named = (
+                " it names a grant, and a grant is not an envelope: opening one beneath it "
+                "would skip the subject check that 'ctrlrun delegate' applies there, and a "
+                "grant has no 'controls:' to gate the opener instead"
+                if envelope_id in self._grants
+                else " no envelope of that name is declared"
+            )
+            raise AuthorityEscalation(
+                f"no break-glass envelope {envelope_id!r};{named}. An envelope is declared "
+                "under 'authority: break_glass:' and names the controls that gate who may open "
+                "it (SPEC-v0.8 §5.2, §5.3.1)",
+                reason=UNKNOWN_PARENT,
+                parent_id=envelope_id,
+            )
+        if by.expires_at is not None and now > by.expires_at:
+            raise IdentityError(
+                f"the opening principal's credential expired at {by.expires_at}; an expired "
+                "credential may not create authority (SPEC-v0.3 §5.3 rule 0)"
+            )
+        if grant.id:
+            raise InvalidArgument(
+                f"the grant passed to break_glass() carries id {grant.id!r}; a delegation's id "
+                "is assigned, not chosen (SPEC-v0.3 §5.2)"
+            )
+        if grant.expires_at is None:
+            # §5.3's one added rule. An ordinary delegation may carry no expiry; a break-glass
+            # grant that outlives the incident is the thing this section exists to prevent.
+            raise AuthorityEscalation(
+                f"a grant opened beneath {envelope_id!r} must carry 'expires_at'; break-glass "
+                "authority that outlives the incident is what an envelope exists to prevent "
+                "(SPEC-v0.8 §5.3)",
+                reason=CONTAINMENT,
+                parent_id=envelope_id,
+                dimension="expires_at",
+            )
+        if grant.expires_at > now + envelope.max_ttl:
+            raise AuthorityEscalation(
+                f"a grant opened beneath {envelope_id!r} expires at {grant.expires_at}, beyond "
+                f"its max_ttl of {envelope.max_ttl} from now ({now + envelope.max_ttl})",
+                reason=CONTAINMENT,
+                parent_id=envelope_id,
+                dimension="expires_at",
+            )
+        depth = 1
+        if depth > self._max_delegation_depth:
+            raise AuthorityEscalation(
+                f"a delegation of {envelope_id!r} would be at depth {depth}, beyond "
+                f"max_delegation_depth {self._max_delegation_depth}",
+                reason=MAX_DEPTH,
+                parent_id=envelope_id,
+            )
+        dimension = contained_dimension(envelope.grant, grant)
+        if dimension is not None:
+            raise AuthorityEscalation(
+                f"the break-glass grant is not contained in {envelope_id!r} on {dimension!r}; "
+                "omission never means unlimited (SPEC-v0.3 §5.4)",
+                reason=CONTAINMENT,
+                parent_id=envelope_id,
+                dimension=dimension,
+            )
+        delegation_id = new_delegation_id()
+        return Delegation(
+            delegation_id=delegation_id,
+            parent_id=envelope_id,
+            depth=depth,
+            grant=replace(grant, id=delegation_id),
+            created_by=by,
+            created_via="break-glass",
+            created_at=now,
+        )
 
     def plan_delegation(
         self, parent_id: str, grant: Grant, *, by: Principal, store: StateStore, now: datetime
@@ -960,6 +1636,27 @@ class Authority:
         """§5.3 rules 1 to 3, and the walked depth rule 5 needs."""
         # §5.2 — a root grant wins any collision: an id is resolved against the document first
         # and the store second.
+        if parent_id in self._envelopes:
+            # **SPEC-v0.8 §5.3.1, the direction an independent review found open.** §5.3.1
+            # guards `break-glass --envelope <a grant id>`; nothing guarded `delegate --parent
+            # <an envelope id>`, which is strictly worse. An earlier build of this method
+            # returned the envelope's grant here, and `plan_delegation` then created authority
+            # beneath it with **no expiry requirement, no `max_ttl`, no entitlement check and
+            # no `created_via` saying what it was** -- a permanent break-glass grant, opened
+            # from a shell by anyone whose `--as` matched the envelope's subject, which is a
+            # pattern over the agents the grant may be *for*.
+            #
+            # `plan_break_glass` resolves envelopes itself and applies §5.3's rules. This path
+            # refuses them by name. The delegable-exemption of §5.2 point 4 lives at the two
+            # read sites that walk an existing chain, where it cannot create anything.
+            raise AuthorityEscalation(
+                f"{parent_id!r} is a break-glass envelope, not a grant. Authority beneath an "
+                "envelope is opened with 'ctrlrun break-glass --envelope', which requires an "
+                "expiry inside its max_ttl and checks the opener against the controls that "
+                "gate it; delegating beneath one directly would skip both (SPEC-v0.8 §5.3.1)",
+                reason=UNKNOWN_PARENT,
+                parent_id=parent_id,
+            )
         root = self._grants.get(parent_id)
         if root is not None:
             if not root.delegable:
@@ -1013,8 +1710,13 @@ class Authority:
         # new delegations appearing anywhere beneath it rather than only one level down.
         invalid = walk.missing_parent_id is not None or walk.cycle_at is not None
         if not invalid:
-            invalid = any(node.is_revoked for node in walk.nodes[1:]) or any(
-                ancestor.is_expired(now) or not ancestor.delegable for ancestor in walk.ancestors
+            # SPEC-v0.8 §5.2 point 4, second site: the same exemption, or a delegation
+            # **beneath** a break-glass grant is refused `parent_not_valid` and §5.4's
+            # attenuation bullet cannot hold (T337).
+            invalid = (
+                any(node.is_revoked for node in walk.nodes[1:])
+                or any(ancestor.is_expired(now) for ancestor in walk.ancestors)
+                or walk.undelegable_ancestor
             )
         if invalid:
             raise AuthorityEscalation(
@@ -1025,6 +1727,38 @@ class Authority:
         if walk.depth_exceeded is not None:
             return parent.grant, walk.depth_exceeded
         return parent.grant, len(walk.nodes)
+
+    def _hop_candidate(
+        self, hop: str, action: Action, store: StateStore
+    ) -> list[tuple[str, Grant, Delegation | None]]:
+        """The one candidate a presented hop admits (SPEC-v0.10 §2.3.2 rules 1 and 2).
+
+        **The named delegation is the only candidate.** Not "as well as" the principal's own
+        grants, and not "the narrowest of them": §2.3.1 measured what the alternative does, which
+        is that a receiving agent holding a grant of its own is authorised by that one, the hop is
+        never consulted, and `_charges_for` returns `()` so the issuer's budget pays nothing.
+
+        **Its chain is walked, not offered.** The ancestors are not candidates. `_check_chain`
+        walks them exactly as it does for any delegation, so a root addressed to `agent: "*"`
+        cannot authorise the action at its own width, which is the same hole with one extra step.
+
+        Two refusals belong to the hop rather than to the chain, and both are `authority_hop`: an
+        id naming no delegation, and one whose grant does not reach this action's shape. Everything
+        else keeps the reason it already has (§2.3.2 rule 3), because those are facts about a grant
+        the hop did reach.
+
+        A **revoked** delegation is returned rather than refused here, deliberately: it is a live
+        record of an authority that was cut, `_check_chain` answers `authority_revoked` for it, and
+        §2.3.2 rule 3 forbids `authority_hop` standing in for that.
+        """
+        record = store.get_delegation(hop)
+        if record is None:
+            raise _HopRefusedError()
+        delegation = _delegation_from_record(record)
+        dimension = unmatched_shape(delegation.grant, action)
+        if dimension is not None:
+            raise _HopRefusedError(grant_id=hop, dimension=dimension)
+        return [(delegation.delegation_id, delegation.grant, delegation)]
 
     def _candidates(self, store: StateStore) -> list[tuple[str, Grant, Delegation | None]]:
         """Every grant this principal could hold: the document's, then the store's (§4.3)."""
@@ -1050,6 +1784,18 @@ class Authority:
             root = self._grants.get(parent_id)
             if root is not None:
                 return _Walk(tuple(nodes), root=root, root_id=parent_id)
+            # SPEC-v0.8 §5.2 point 2: a break-glass delegation names an **envelope** as its
+            # parent, and the walk resolved roots out of `_grants` alone. Without this its
+            # chain has no root at all and every action under it is refused
+            # `authority_escalation` with a missing parent.
+            envelope = self._envelopes.get(parent_id)
+            if envelope is not None:
+                return _Walk(
+                    tuple(nodes),
+                    root=envelope.grant,
+                    root_id=parent_id,
+                    root_is_envelope=True,
+                )
             if parent_id in seen:
                 return _Walk(tuple(nodes), cycle_at=parent_id)
             record = store.get_delegation(parent_id)
@@ -1099,6 +1845,24 @@ class Authority:
                 return _ChainCheck(
                     depth, AuthorityResult(False, AUTHORITY_ESCALATION, dimension=dimension)
                 )
+        # SPEC-v0.8 §5.2, and `v0.3 §5.6`'s stated purpose: **a narrowed root narrows
+        # everything beneath it.** `max_ttl` was checked once, at creation, and is not a §5.4
+        # containment row, so an operator who narrowed an envelope while an incident was still
+        # running narrowed nothing: a four-hour grant opened under `PT4H` kept running under
+        # `PT15M`. Every other envelope dimension already narrows live grants here, because the
+        # envelope is the chain's root parent; this is the one that did not, and it is the one
+        # bound an operator reaches for first.
+        envelope = None if walk.root_id is None else self._envelopes.get(walk.root_id)
+        if envelope is not None and walk.nodes:
+            opened = walk.nodes[-1]
+            if (
+                opened.grant.expires_at is None
+                or opened.grant.expires_at > opened.created_at + envelope.max_ttl
+            ):
+                return _ChainCheck(
+                    depth,
+                    AuthorityResult(False, AUTHORITY_ESCALATION, dimension="max_ttl"),
+                )
         if walk.cycle_at is not None:
             # A chain that loops is a store somebody has edited by hand, and it belongs with
             # the other unreadable-record cases rather than with the ordinary escalations.
@@ -1116,15 +1880,29 @@ class Authority:
             return _ChainCheck(
                 depth, AuthorityResult(False, AUTHORITY_ESCALATION, depth_exceeded=depth)
             )
-        if any(not ancestor.delegable for ancestor in walk.ancestors):
+        if walk.undelegable_ancestor:
             # Rule 6 exists because `delegable` is not a §5.4 row and rule 4 would therefore
             # never see it. An operator setting `delegable: false` on a root grant is shutting
             # down a chain they believe is compromised.
+            #
+            # SPEC-v0.8 §5.2 point 4, third site: this runs on **every evaluation**, so without
+            # the envelope exemption a break-glass grant is created successfully and then
+            # authorises nothing, refused `authority_escalation` with no dimension named, which
+            # is the least diagnosable refusal in this file (T326b).
             return _ChainCheck(depth, AuthorityResult(False, AUTHORITY_ESCALATION))
         return _ChainCheck(depth, None)
 
 
 # --- loading (SPEC-v0.3 §4.1, §4.2) ----------------------------------------------------
+
+
+def _canonical_envelope(envelope: BreakGlassEnvelope) -> dict[str, PlainValue]:
+    """One envelope in the shape `policy_hash` is taken over (SPEC-v0.8 §5.2)."""
+    rendered = _canonical_grant(envelope.grant)
+    fields: dict[str, PlainValue] = dict(rendered) if isinstance(rendered, dict) else {}
+    fields["max_ttl"] = int(envelope.max_ttl.total_seconds())
+    fields["controls"] = list(envelope.controls)
+    return fields
 
 
 def canonical_grants(authority: Authority | None) -> PlainValue:
@@ -1156,6 +1934,20 @@ def canonical_grants(authority: Authority | None) -> PlainValue:
         "grants": {
             grant_id: _canonical_grant(grant) for grant_id, grant in authority.grants.items()
         },
+        # SPEC-v0.8 §5.2, §11.1. **The envelope is the widest authority an incident can reach**,
+        # and the argument for declaring it in the policy is that it was evidenced before the
+        # incident by a document somebody reviewed. That argument is only true if widening it
+        # moves the hash, so `max_ttl` is rendered here with the rest.
+        #
+        # Rendered through `_canonical_grant` like any grant, whose closed field list always
+        # emits `delegable`. An envelope carries no such key, so it hashes `delegable: false` --
+        # the parser default every grant omitting the key already hashes as -- and the read-site
+        # rule of §5.2 point 4 does not touch the rendered value. That is deliberate: the hash
+        # is a statement about the document, never about a runtime decision (T332).
+        "break_glass": {
+            envelope_id: _canonical_envelope(envelope)
+            for envelope_id, envelope in authority.envelopes.items()
+        },
     }
 
 
@@ -1172,6 +1964,28 @@ def _canonical_grant(grant: Grant) -> PlainValue:
         "expires_at": None if grant.expires_at is None else grant.expires_at.isoformat(),
         "resources": None if grant.resources is None else list(grant.resources),
         "subject": {"agent": grant.subject.agent, "user": grant.subject.user},
+        # SPEC-v0.9 §6.7 — a dimension outside the hash is one an operator widens without the
+        # hash moving, which is `SPEC-v0.8 §5.2`'s reason for `max_ttl` in this same field list.
+        "tasks": None if grant.tasks is None else list(grant.tasks),
+        # SPEC-v0.9 §2.8, the same reason and the sharper case: an operator widens a budget from
+        # 10,000 to 10,000,000, the hash does not move, and every approval bound to it by
+        # `v0.6 §7.1` stays valid against a document that now permits a thousand times more.
+        # Rendered in document order, which §2.2 makes meaningful.
+        "budgets": (
+            None
+            if grant.budgets is None
+            else [
+                {
+                    "metric": budget.metric,
+                    "limit": budget.limit,
+                    # Integer seconds, exactly as `_canonical_envelope` renders `max_ttl`: a
+                    # `timedelta` is not a `PlainValue` (`action.py:19`) and so cannot go through
+                    # `canonical_bytes`, and seconds is the spelling this file already uses.
+                    "window": int(budget.window.total_seconds()),
+                }
+                for budget in grant.budgets
+            ]
+        ),
     }
 
 
@@ -1212,10 +2026,11 @@ def _optional_from_yaml(
     # as well as in `Policy`, because §8.3's `--authority` document is never read by the
     # policy loader at all.
     require_v3(document, str(schema), source)
-    return _from_section(document[_AUTHORITY_KEY], source)
+    require_v7(document, str(schema), source)
+    return _from_section(document[_AUTHORITY_KEY], source, standalone=standalone)
 
 
-def _from_section(section: object, source: str) -> Authority:
+def _from_section(section: object, source: str, *, standalone: bool = False) -> Authority:
     where = f"{source}: authority"
     if not isinstance(section, Mapping):
         raise PolicyError(
@@ -1250,7 +2065,110 @@ def _from_section(section: object, source: str) -> Authority:
                 "can resolve later"
             )
         grants[grant.id] = grant
-    return Authority(grants, max_delegation_depth=depth, source=source)
+    if standalone and "break_glass" in section:
+        # SPEC-v0.8 §5.2. Not "allowed but its citations must resolve": this document shape has
+        # no control registry to resolve them against, so the only envelope it could express is
+        # an **ungated** one, and the single deployment unable to state the gate would be the
+        # one whose break-glass anybody verified could open.
+        raise PolicyError(
+            f"{where}: a standalone authority document may not declare 'break_glass'. An "
+            "envelope names the controls whose approver_role gates who may open it, and this "
+            "document shape carries no control registry to resolve them against; move the "
+            "authority section into the policy document, where the registry is (SPEC-v0.8 §5.2)"
+        )
+    envelopes = _parse_envelopes(section.get("break_glass"), grants, where)
+    return Authority(grants, max_delegation_depth=depth, source=source, envelopes=envelopes)
+
+
+def _parse_envelopes(
+    block: object, grants: Mapping[str, Grant], where: str
+) -> dict[str, BreakGlassEnvelope]:
+    """SPEC-v0.8 §5.2's `break_glass:` mapping, by id."""
+    if block is None:
+        return {}
+    if not isinstance(block, Mapping):
+        raise PolicyError(
+            f"{where}: 'break_glass' must be a mapping of envelope id to envelope, got "
+            f"{_type_name(block)}"
+        )
+    envelopes: dict[str, BreakGlassEnvelope] = {}
+    for identifier, entry in block.items():
+        spot = f"{where} break_glass[{identifier!r}]"
+        if not isinstance(identifier, str) or not identifier:
+            raise PolicyError(f"{spot}: an envelope id must be a non-empty string")
+        if identifier in grants:
+            # §5.2 and §5.3.1: rule 4 is substituted only for a parent that came from
+            # `break_glass:`, so "which mapping did this id come from" must always have an
+            # answer. An id in both makes it undecidable, and the resolution that favoured
+            # `grants:` would silently skip the gate.
+            raise PolicyError(
+                f"{spot}: {identifier!r} is declared in both 'grants' and 'break_glass'. "
+                "Which mapping a parent came from decides whether the envelope's controls "
+                "gate who may open it (SPEC-v0.8 §5.3.1), so one id cannot be in both"
+            )
+        if not isinstance(entry, Mapping):
+            raise PolicyError(f"{spot}: an envelope must be a mapping, got {_type_name(entry)}")
+        for refused in sorted(_ENVELOPE_REFUSED_KEYS):
+            if refused in entry:
+                raise PolicyError(
+                    f"{spot}: an envelope may not carry {refused!r}. An envelope exists only "
+                    "to be a parent, so 'delegable' is what it means rather than a key, and "
+                    "what bounds it in time is 'max_ttl', which every grant beneath it obeys "
+                    "(SPEC-v0.8 §5.2)"
+                )
+        _reject_unknown_keys(
+            entry, (_GRANT_KEYS - _ENVELOPE_REFUSED_KEYS - {"id"}) | _ENVELOPE_ONLY_KEYS, spot
+        )
+        if "max_ttl" not in entry:
+            raise PolicyError(
+                f"{spot}: 'max_ttl' is required. It is what bounds every grant opened beneath "
+                "this envelope in time, and a break-glass grant that outlives the incident is "
+                "what SPEC-v0.8 §5 exists to prevent"
+            )
+        max_ttl = _parse_duration(entry["max_ttl"], f"{spot}: max_ttl")
+        controls = entry.get("controls", [])
+        if not isinstance(controls, list) or not all(
+            isinstance(item, str) and item for item in controls
+        ):
+            raise PolicyError(f"{spot}: 'controls' must be a list of control ids, got {controls!r}")
+        grant = _parse_grant(
+            {key: value for key, value in entry.items() if key not in _ENVELOPE_ONLY_KEYS}
+            | {"id": identifier},
+            spot,
+        )
+        try:
+            envelopes[identifier] = BreakGlassEnvelope(
+                grant=grant, max_ttl=max_ttl, controls=tuple(controls)
+            )
+        except InvalidArgument as exc:
+            raise PolicyError(f"{spot}: {exc}") from exc
+    return envelopes
+
+
+def _parse_duration(value: object, where: str) -> timedelta:
+    """An ISO-8601 duration, the subset `max_ttl` needs: `PT<n>H`, `PT<n>M`, `PT<n>S`, `P<n>D`.
+
+    Written here rather than taken from a dependency, because the core is stdlib plus `pyyaml`
+    and `click`, and because a permissive parser would accept a month or a year, which are not
+    durations a clock can add without a calendar.
+    """
+    if not isinstance(value, str) or not value:
+        raise PolicyError(f"{where}: must be an ISO-8601 duration string, got {value!r}")
+    match = _DURATION.fullmatch(value)
+    if match is None:
+        raise PolicyError(
+            f"{where}: {value!r} is not a duration this reader accepts. Write it as 'PT4H', "
+            "'PT30M', 'PT90S' or 'P2D'; months and years are not durations a clock can add"
+        )
+    days, hours, minutes, seconds = (int(part or 0) for part in match.groups())
+    found = timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
+    if found <= timedelta(0):
+        raise PolicyError(f"{where}: {value!r} is not a positive duration")
+    return found
+
+
+#: The subset of ISO-8601 above. Anchored, so `P1MT1H` is refused rather than read as an hour.
+_DURATION: Final = re.compile(r"P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?")
 
 
 def grant_from_yaml(text: str, *, source: str = "<string>") -> Grant:
@@ -1314,11 +2232,48 @@ def _parse_grant(entry: object, where: str, *, unassigned: bool = False) -> Gran
             ),
             expires_at=_parse_expires_at(entry, where),
             delegable=delegable,
+            tasks=(_parse_patterns(entry["tasks"], "tasks", where) if "tasks" in entry else None),
+            budgets=(_parse_budgets(entry["budgets"], where) if "budgets" in entry else None),
         )
     except InvalidArgument as exc:
         # The model refuses what the loader refuses (§4.8), so the loader delegates the
         # grammar to it rather than keeping a second copy that can drift.
         raise PolicyError(f"{where}: {exc}") from exc
+
+
+_BUDGET_KEYS: Final = frozenset({"metric", "limit", "window"})
+
+
+def _parse_budgets(value: object, where: str) -> tuple[Budget, ...]:
+    """SPEC-v0.9 §2.2. A list of `{metric, limit, window}`, and nothing else.
+
+    The grammar is closed for `v0.1 §3.1`'s reason: a key this loader silently dropped would be a
+    limit an operator wrote and nothing enforced. Errors carry the index, because a document with
+    two budgets on one metric is the case §2.2 exists for and "one of them is wrong" is not an
+    error message somebody can act on.
+    """
+    if not isinstance(value, list) or not value:
+        raise PolicyError(
+            f"{where}: 'budgets' must be a non-empty list of "
+            "{metric, limit, window} mappings, or absent"
+        )
+    parsed: list[Budget] = []
+    for index, entry in enumerate(value):
+        spot = f"{where}: budgets[{index}]"
+        if not isinstance(entry, Mapping):
+            raise PolicyError(f"{spot}: must be a mapping, got {_type_name(entry)}")
+        _reject_unknown_keys(entry, _BUDGET_KEYS, spot)
+        for key in sorted(_BUDGET_KEYS):
+            if key not in entry:
+                raise PolicyError(f"{spot}: {key!r} is required")
+        window = _parse_duration(entry["window"], f"{spot}: window")
+        try:
+            parsed.append(Budget(metric=entry["metric"], limit=entry["limit"], window=window))
+        except InvalidArgument as exc:
+            # §2.2 — the model refuses what the loader refuses, so the loader delegates the
+            # grammar to it rather than keeping a second copy that can drift.
+            raise PolicyError(f"{spot}: {exc}") from exc
+    return tuple(parsed)
 
 
 def _parse_subject(value: object, where: str) -> Subject:
@@ -1415,6 +2370,7 @@ __all__ = [
     "AUTHORITY_ESCALATION",
     "AUTHORITY_EXPIRED",
     "AUTHORITY_GRANT",
+    "AUTHORITY_HOP",
     "AUTHORITY_REVOKED",
     "AUTHORITY_UNREADABLE",
     "CONTAINMENT",
@@ -1439,6 +2395,8 @@ __all__ = [
     "grant_from_yaml",
     "grant_to_json",
     "matches",
+    "narrowed_dimensions",
     "new_delegation_id",
+    "unmatched_shape",
     "validate_pattern",
 ]

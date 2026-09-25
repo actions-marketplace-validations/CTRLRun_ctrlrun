@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """G4's process target. SPEC-v0.4 §2.2, §3.6.
 
 A module-level function taking one picklable argument — a JSON string — because a bound method
@@ -105,9 +107,11 @@ def attempt(payload: str) -> None:
                 from ..control import with_approval
 
                 with with_approval(request["approval_id"]):
-                    control.execute(action, executor, request["effect_key"])
+                    control.execute(
+                        action, executor, request["effect_key"], task=request.get("task")
+                    )
             else:
-                control.execute(action, executor, request["effect_key"])
+                control.execute(action, executor, request["effect_key"], task=request.get("task"))
             result["outcome"] = OUTCOME_COMMITTED
         except CTRLRunError as refused:
             result["outcome"] = OUTCOME_REFUSED

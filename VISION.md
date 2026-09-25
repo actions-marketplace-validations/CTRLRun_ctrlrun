@@ -1,6 +1,6 @@
 # VISION.md
 
-> **This is not a build spec, and it is not the state of the code.** It was written before v0.1 shipped, so that the long-term shape is written down once and stops leaking into READMEs, schemas, and PRs. What has actually shipped is in [`docs/docs/ROADMAP.md`](docs/docs/ROADMAP.md) and in each version's `docs/SPEC-v0.x.md`; where a section below has since been built, a *Status* line says which version built it and where it differs from the sketch. Everything without one is still a sketch, and nothing here is a commitment. Do not derive tasks from this file.
+> **This is not a build spec, and it is not the state of the code.** It was written before v0.1 shipped, so that the long-term shape is written down once and stops leaking into READMEs, schemas, and PRs. What has actually shipped is in [`https://ctrlrun.dev/docs/ROADMAP`](https://ctrlrun.dev/docs/ROADMAP) and in each version's `docs/SPEC-v0.x.md`; where a section below has since been built, a *Status* line says which version built it and where it differs from the sketch. Everything without one is still a sketch, and nothing here is a commitment. Do not derive tasks from this file.
 
 ---
 
@@ -12,15 +12,15 @@ That creates a new infrastructure question:
 
 **How much authority should a machine have over each consequential action — and how do we enforce it, prove it, and recover when execution goes wrong?**
 
-CTRLRun is the enforcement infrastructure between **intention** and **consequence**. Not between prompt and model.
+ctrlrun is the enforcement infrastructure between **intention** and **consequence**. Not between prompt and model.
 
 ## 2. Two concentric circles
 
-**Circle 1 — the wedge.** Agent executes payment → response lost → agent retries → CTRLRun refuses the blind retry. Narrow. Instantly understood. This is v0.1.
+**Circle 1 — the wedge.** Agent executes payment → response lost → agent retries → ctrlrun refuses the blind retry. Narrow. Instantly understood. This is v0.1.
 
 **Circle 2 — the product.** Action-level autonomy infrastructure: for each action, is it authorized, how much autonomy, is approval needed, was *this* action approved, is execution safe, did it already happen, what was the outcome. This is v0.2–v0.5.
 
-CTRLRun is consequence-specific, not industry-specific. If an agent only reads, searches, summarizes, or answers, CTRLRun is low value. It earns its place where an agent has write access to the real world.
+ctrlrun is consequence-specific, not industry-specific. If an agent only reads, searches, summarizes, or answers, ctrlrun is low value. It earns its place where an agent has write access to the real world.
 
 ## 3. End-state architecture
 
@@ -100,13 +100,13 @@ Delegation attenuates, never amplifies: `child ⊆ parent`. Human €100k → fi
 
 *Status: v0.6, as the kernel-side object a sector pack configures.*
 
-**Recovery** — declarative per-action `on_ambiguous: reconcile` / `on_failure: compensate`. CTRLRun coordinates safety semantics; it never becomes the workflow scheduler. Integrate with Temporal-class runtimes; don't recreate them.
+**Recovery** — declarative per-action `on_ambiguous: reconcile` / `on_failure: compensate`. ctrlrun coordinates safety semantics; it never becomes the workflow scheduler. Integrate with Temporal-class runtimes; don't recreate them.
 
 *Status: reconciliation shipped in v0.2 as a hook that resolves an `AMBIGUOUS` effect, and `ctrlrun resolve` is the human path. Compensation and sagas are not built and are on the do-not-build list.*
 
 **Verify** — `ctrlrun verify` runs deterministic adversarial scenarios against a real configuration and reports per-guarantee pass/fail with counterexamples. Badge means "declared guarantees pass", never "secure".
 
-*Status: built in v0.4 (`docs/SPEC-v0.4.md`, `docs/docs/verify.md`). One thing the sketch did not have: a guarantee the configuration cannot exercise reports `not_applicable` with a reason, and not applicable is not a pass.*
+*Status: built in v0.4 (`docs/SPEC-v0.4.md`, `https://ctrlrun.dev/docs/verify`). One thing the sketch did not have: a guarantee the configuration cannot exercise reports `not_applicable` with a reason, and not applicable is not a pass.*
 
 ## 6. Standards posture
 
@@ -118,7 +118,7 @@ Align, don't invent: OWASP ACS, MCP, A2A, OAuth, OpenTelemetry, and NIST agent i
 
 **Full depth (a content track, after v0.6).** The same nine sectors, each with a control registry, approver roles, data scope, consequence defaults, and worked examples. It waits on v0.6 because that is where the control registry and data-scope primitives land, and a pack should be configuration rather than code; it waits on nothing else. Packs are released individually as `packs/<sector>/` under their own version tags — `packs-payments-1.0` and so on — never sharing a version with the kernel, never gating a kernel release and never gated by one. Kernel versions ship correctness; content ships on its own cadence.
 
-Each pack is authored in one AI session and reviewed in a separate AI session that did not author it, against cited public sources — PCI DSS, PSD2, the HIPAA Security Rule, SOX/COSO and maker-checker guidance, ABA Model Rules, NIST SP 800-53, CIS benchmarks, records-management and employment-law basics. The review ships with the pack as `REVIEW.md`, listing every control, the source clause it derives from, and every gap found; unresolved gaps stay listed rather than being quietly closed. A pack states that it was authored and reviewed by AI against those sources, and never describes itself as compliant with any regulation. That is a claim only an accountable human reviewer can make, and CTRLRun does not make it on anyone's behalf.
+Each pack is authored in one AI session and reviewed in a separate AI session that did not author it, against cited public sources — PCI DSS, PSD2, the HIPAA Security Rule, SOX/COSO and maker-checker guidance, ABA Model Rules, NIST SP 800-53, CIS benchmarks, records-management and employment-law basics. The review ships with the pack as `REVIEW.md`, listing every control, the source clause it derives from, and every gap found; unresolved gaps stay listed rather than being quietly closed. A pack states that it was authored and reviewed by AI against those sources, and never describes itself as compliant with any regulation. That is a claim only an accountable human reviewer can make, and ctrlrun does not make it on anyone's behalf.
 
 Same kernel, different `ctrlrun.yaml` and control registries.
 

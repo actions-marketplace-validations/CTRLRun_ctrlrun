@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
 """`ctrlrun verify` — the registry, the engine, G1-G6 and G10. SPEC-v0.4 §2, §3; T100-T107.
 
 T125 and T125b live here too, despite sitting at the end of the number range: they are the two
@@ -113,9 +115,9 @@ def test_T100_the_authority_example_passes_every_non_authority_guarantee():
     report = run(AUTHORITY_PAYMENTS)
     results = _by_id(report)
 
-    for gid in ("G1", "G2", "G3", "G4", "G5", "G6", "G10", "G11"):
+    for gid in ("G1", "G2", "G3", "G4", "G5", "G6", "G10", "G11", "G12"):
         assert results[gid].status is Status.PASS, (gid, results[gid].reason)
-    for gid in ("G1", "G2", "G3", "G4", "G5", "G10"):
+    for gid in ("G1", "G2", "G3", "G4", "G5", "G10", "G12"):
         assert results[gid].action == "stripe.refund", gid
     assert results["G3"].effect_key == "refund:ctrlrun-verify-payment_id"
     assert report.exit_code == 0
@@ -129,7 +131,7 @@ def test_T100_the_starter_policy_exercises_every_non_authority_guarantee():
     report = run(EXAMPLE_POLICY)
     results = _by_id(report)
 
-    for gid in ("G1", "G2", "G3", "G4", "G5", "G6", "G7", "G10", "G11"):
+    for gid in ("G1", "G2", "G3", "G4", "G5", "G6", "G7", "G10", "G11", "G12"):
         assert results[gid].status is Status.PASS, (gid, results[gid].reason)
     assert results["G1"].action == "k8s.delete_namespace"
     assert results["G10"].action == "customer.read"
@@ -161,20 +163,36 @@ def test_T101_a_policy_with_no_approve_rule_makes_G1_and_G2_not_applicable(tmp_p
     report = run(path)
     results = _by_id(report)
 
-    for gid in ("G1", "G2"):
+    # G16 is N/A for G1's reason: a precondition binds only where an approval is consumed
+    # (SPEC-v0.7 §8.9), and nothing here requires one.
+    # G18 joins them for the same reason, and it is a statement about this document: verify
+    # supplies the approver identity itself (SPEC-v0.8 §11.7), so what makes G18 inapplicable
+    # here is that nothing requires approval, never that nobody configured one.
+    for gid in ("G1", "G2", "G16", "G18"):
         assert results[gid].status is Status.NOT_APPLICABLE, gid
         assert results[gid].reason == reg.NO_APPROVE_RULE
         # The `else` branch: either one reported `pass` is the defect this test exists for.
         assert results[gid].status is not Status.PASS
     assert report.applicable == report.passed + report.failed
-    # Ten in the catalogue; G1 and G2 for the missing approve band, G8 and G9 for the
-    # missing authority section. Six applicable, and the count is over those six.
-    assert report.applicable == 7
-    assert report.not_applicable == 4
+    # G1, G2, G16 and G18 for the missing approve band, G8 and G9 for the missing authority
+    # section, G13, which is N/A on every SQLite run: SQLite has no clock of its own, and G15,
+    # because this document names no `max_attempts` (SPEC-v0.7 §8.9). The rest are applicable,
+    # G14 among them, and the count is over those.
+    # 13 since v0.11 item 2's `G28`, on top of item 4's `G31`: both need only an action, so
+    # both are applicable wherever this document's others are.
+    assert report.applicable == 16
+    # Derived: every guarantee is applicable or not, exactly once. The literal moved with every
+    # milestone that added an id (G19, then G25), and the invariant never did.
+    assert report.applicable + report.not_applicable == len(reg.GUARANTEES)
     text = report.to_text()
-    assert "8/8" not in text
+    # The fraction is passes over applicable and never the catalogue size: with eight N/As a
+    # seventeen-guarantee catalogue must not report seventeen over seventeen.
+    assert f"{len(reg.GUARANTEES)}/{len(reg.GUARANTEES)}" not in text
     assert f"{report.passed}/{report.applicable} declared guarantees pass." in text
-    assert "4 not applicable: G1, G2, G8, G9." in text
+    # Derived, not spelled out: the id list moved with every milestone that added a guarantee
+    # (G19, then G25) and what the assertion is for is the shape, that the N/A ids are named.
+    na = [result.id for result in report.guarantees if result.status is Status.NOT_APPLICABLE]
+    assert f"{len(na)} not applicable: {', '.join(na)}." in text
 
 
 def test_T101b_zero_applicable_guarantees_is_not_a_pass(tmp_path):
@@ -335,7 +353,7 @@ from ctrlrun.effect import DEFAULT_LEASE, EffectState, Reservation
 from ctrlrun.state import _iso
 
 
-def _always_reserves(self, effect_key, action_id, lease=DEFAULT_LEASE):
+def _always_reserves(self, effect_key, action_id, lease=DEFAULT_LEASE, charges=()):
     now = self._clock()
     connection = self._connection()
     connection.execute("BEGIN IMMEDIATE")
@@ -531,31 +549,6 @@ def test_T106_G4_contends_in_real_processes(tmp_path):
 
 # --- T107: verify reaches no network ---------------------------------------------------------
 
-_REFUSE_EVERY_SOCKET = '''\
-"""Imported by `site` at startup: nothing under verify may open a socket."""
-
-import socket
-
-_real = socket.socket
-
-
-class _Refusing(_real):
-    def connect(self, *args, **kwargs):
-        raise RuntimeError("verify tried to connect; verify runs with no network")
-
-    def connect_ex(self, *args, **kwargs):
-        raise RuntimeError("verify tried to connect; verify runs with no network")
-
-
-def _refuse(*args, **kwargs):
-    raise RuntimeError("verify tried to resolve a name; verify runs with no network")
-
-
-socket.socket = _Refusing
-socket.create_connection = _refuse
-socket.getaddrinfo = _refuse
-'''
-
 _ASSERT_THE_GUARD_IS_LIVE = """
 import socket, sys
 
@@ -574,11 +567,12 @@ sys.exit(report.exit_code)
 """
 
 
-def test_T107_a_full_run_completes_with_no_network(tmp_path):
+def test_T107_a_full_run_completes_with_no_network(tmp_path, no_network):
+    """SPEC-v0.7 §8.9 amends the rule to "no connection except to the store `--store-url` names
+    and to loopback listeners verify bound itself", and the guard, `conftest.py`'s one definition,
+    admits exactly that: G12's listener and nothing else. T230 asserts how wide it is."""
     path = _write(tmp_path, WITH_EFFECTS)
-    guard = tmp_path / "guard"
-    guard.mkdir()
-    (guard / "sitecustomize.py").write_text(_REFUSE_EVERY_SOCKET, encoding="utf-8")
+    guard = no_network
     script = tmp_path / "check.py"
     script.write_text(_ASSERT_THE_GUARD_IS_LIVE, encoding="utf-8")
 
@@ -785,8 +779,26 @@ def test_G11_is_applicable_even_where_every_action_is_denied(tmp_path):
 
 
 def test_the_catalogue_is_closed_and_ordered():
-    assert reg.CATALOGUE == "ctrlrun.guarantees/v2"
-    assert [guarantee.id for guarantee in reg.GUARANTEES] == [f"G{n}" for n in range(1, 12)]
+    """SPEC-v0.11 §8: `v7` is G1 to G32, and each id lands with its item. Ordered by number, so
+    an id that arrives before a lower one still sits where a reader looks for it, and unreleased
+    `main` carries a partial `v7` until the release item asserts every row.
+
+    **No stub rows.** The upper bound is what v0.11 may reach; what is asserted about the middle
+    is that every id present is one of them and that none is out of order. A catalogue holding an
+    id whose check does not exist yet would report something before it could, which is a false
+    green (`v0.7 §9.4`'s D27).
+
+    **G28 to G30 and G32 are absent here on purpose**, and G31 is present without them: §8
+    assigns ids in **item** order rather than landing order, so that splitting the milestone
+    renumbers nothing, and item 4 lands before items 2 and 3. An assertion that G28 is present
+    would be the stub row this forbids."""
+    assert reg.CATALOGUE == "ctrlrun.guarantees/v7"
+    ids = [guarantee.id for guarantee in reg.GUARANTEES]
+    assert ids[:11] == [f"G{n}" for n in range(1, 12)]
+    assert "G13" in ids and "G16" in ids and "G18" in ids
+    assert ids == sorted(ids, key=lambda gid: int(gid[1:])), ids
+    assert len(ids) == len(set(ids))
+    assert set(ids) <= {f"G{n}" for n in range(1, 33)}, ids
     for guarantee in reg.GUARANTEES:
         assert guarantee.descends_from, f"{guarantee.id} names no acceptance test"
 
@@ -854,16 +866,36 @@ def test_observe_mode_is_refused_before_any_scenario_runs(tmp_path):
     assert "observe" in str(refused.value)
 
 
-def test_the_v1_payments_template_reports_five_over_five_with_five_not_applicable():
-    """The definition of done, dogfooded rather than described (SPEC-v0.4 §4.1)."""
+def test_the_v1_payments_template_reports_sixteen_over_sixteen():
+    """The definition of done, dogfooded rather than described (SPEC-v0.4 §4.1).
+
+    Ten and not nine since v0.8 item 6, and nine and not eight since item 2. G18 is graded
+    here because this document sends an action to approval and verify supplies the approver
+    identity it grades against; G20 because verify supplies the revocation feed and says so in
+    a note rather than claiming anything about a document that is silent on it (§11.7).
+    """
     report = run(V1_PAYMENTS)
 
     assert report.exit_code == 0
-    assert (report.passed, report.applicable, report.not_applicable) == (6, 6, 5)
+    # 12 since v0.11 item 4 added `G31`, which needs only an action to build a chain from
+    # and is therefore applicable wherever this template's other eleven are.
+    assert (report.passed, report.applicable) == (16, 16)
+    assert report.applicable + report.not_applicable == len(reg.GUARANTEES)
     text = report.to_text()
-    assert "6/6 declared guarantees pass." in text
-    assert "5 not applicable: G3, G4, G5, G8, G9." in text
-    assert "10/10" not in text
+    assert "16/16 declared guarantees pass." in text
+    # G13 is N/A on SQLite, which has no clock of its own; G14 and G15 join G3, G4 and G5 where
+    # the effect template lives in the @protect decorator verify does not read, and where the
+    # document names no `max_attempts`. G16 and G18 are graded: verify brings its own provider
+    # for the first and its own approver identity for the second (§8.9, §11.7).
+    # Derived, not spelled out: the id list moved with every milestone that added a guarantee
+    # (G19, then G25) and what the assertion is for is the shape, that the N/A ids are named.
+    na = [result.id for result in report.guarantees if result.status is Status.NOT_APPLICABLE]
+    assert f"{len(na)} not applicable: {', '.join(na)}." in text
+    # §2.1's rule, and the reason this line exists: **the not-applicable ten are not in the
+    # denominator.** Ten pass and ten are N/A, so a run that folded them in would report 20/20.
+    # It used to read `"10/10" not in text`, which said the same thing while the pass count was
+    # nine and says the opposite now that it is ten.
+    assert "20/20" not in text
 
 
 # --- an N/A reason must be a true statement about the configuration (§2.1) ----------------

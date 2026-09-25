@@ -1,4 +1,6 @@
-"""CTRLRun: make consequential AI-agent actions safe to execute.
+# SPDX-FileCopyrightText: 2026 The ctrlrun contributors
+# SPDX-License-Identifier: Apache-2.0
+"""ctrlrun: make consequential AI-agent actions safe to execute.
 
 Public API re-exports land with build-list item 1 onward; SPEC-v0.1 §8 freezes the names.
 """
@@ -16,11 +18,13 @@ from .approval import (
     Approval,
     ApprovalProvider,
     ApprovalRequest,
+    ApproverIdentity,
     LocalApprovalProvider,
     ScriptedApprovalProvider,
+    VerifiedApprover,
 )
 from .authority import Authority, AuthorityResult, Delegation, Grant, Subject
-from .control import Control, context, protect, with_approval
+from .control import Control, context, idempotency_token, protect, with_approval
 from .effect import EffectRecord, EffectState, ReconcileOutcome
 from .errors import (
     ActionDenied,
@@ -63,6 +67,7 @@ __all__ = [
     "ApprovalRequest",
     "ApprovalRequired",
     "ApprovalTimeout",
+    "ApproverIdentity",
     "Authority",
     "AuthorityDenied",
     "AuthorityEscalation",
@@ -105,12 +110,14 @@ __all__ = [
     "StaticIdentityProvider",
     "Subject",
     "Suspended",
+    "VerifiedApprover",
     "WebhookApprovalProvider",
     "action_hash",
     "banner",
     "canonical_bytes",
     "canonicalize",
     "context",
+    "idempotency_token",
     "needs_approval",
     "parse_conditions",
     "protect",
